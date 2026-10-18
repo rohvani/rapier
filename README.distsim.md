@@ -1,0 +1,39 @@
+# distsim engine changes
+
+This branch starts at `3e12c2679cb1940a876bde93af9cec0cf2f57944`, the source revision
+recorded in the published `rapier3d` 0.35.1 crate. All 212 packaged source and test
+files match that revision byte for byte. The archive SHA-256 is
+`e1c797fd96e34ae075c7b849741f89968ebedb86b584023420d68a1993bdc5cc`.
+
+The changes preserve the engine's existing collision and solver policies:
+
+- `broad_phase_bvh` omits pair enumeration when all enabled colliders have empty
+  `ActiveCollisionTypes`. Bounds, removal, stale-pair cleanup, and query updates
+  still run. The proof is maintained from modified colliders and starts
+  conservatively after deserialization. `set_active_collision_types` now marks
+  filter changes, so stationary pairs reactivate correctly. Fixtures exercise
+  movement, removal, parent/collider re-enabling, clone, serialization, and reused
+  arena slots.
+- `ccd/sweeps.rs` rejects sensor pseudo hits before their sweep when the existing
+  continuous pass would necessarily discard them: neither collider is a sensor,
+  neither requests collision events, or the exact initial-overlap test succeeds.
+  Hooks still run first. Pseudo hits never clamp motion; the final clamped-end
+  test remains in place because a solid impact can change the endpoint. Fixtures
+  cover crossings, overlap exits, event selection, hooks, and solid clamps for
+  default CCD and bullet bodies.
+- `Graph::contains_edge` searches both endpoint adjacency lists until either is
+  exhausted. Duplicate-pair checks in the narrow phase therefore cost
+  O(1 + min(degree(a), degree(b))), avoiding quadratic insertion next to a large
+  sensor. Edge identity lookup, ordering, and serialization remain unchanged.
+  An independent edge-array oracle covers parallel edges, self-loops, swap
+  removals, clone, and serialization. The ignored `edge_existence_star_scaling_diagnostic`
+  compares growth costs without imposing a machine-dependent timing assertion.
+
+The distsim repository pins this branch by commit through `third_party/rapier` and
+patches `rapier3d` to `crates/rapier3d`. Its separate Bevy bridge pin is unchanged.
+Run engine tests from the distsim workspace through its storage guard, compile
+outside runtime limits, and execute the printed test binaries through its bounded
+runner. The engine's `parallel` and `serde-serialize` configurations also require
+validation. Distributed performance claims and remaining issue #7 failures are
+recorded in distsim's `docs/distributed-tests.md`; fixture success alone does not
+establish its realtime acceptance target.

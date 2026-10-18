@@ -596,11 +596,10 @@ impl NarrowPhase {
                         self.intersection_graph.graph.add_node(pair.collider2);
                 }
 
-                if self
+                if !self
                     .intersection_graph
                     .graph
-                    .find_edge(gid1.intersection_graph_index, gid2.intersection_graph_index)
-                    .is_none()
+                    .contains_edge(gid1.intersection_graph_index, gid2.intersection_graph_index)
                 {
                     let _ = self.intersection_graph.add_edge(
                         gid1.intersection_graph_index,
@@ -622,11 +621,10 @@ impl NarrowPhase {
                     gid2.contact_graph_index = self.contact_graph.graph.add_node(pair.collider2);
                 }
 
-                if self
+                if !self
                     .contact_graph
                     .graph
-                    .find_edge(gid1.contact_graph_index, gid2.contact_graph_index)
-                    .is_none()
+                    .contains_edge(gid1.contact_graph_index, gid2.contact_graph_index)
                 {
                     let interaction = if let Some(mut retired) = self.retired_pairs.pop() {
                         retired.reset_for_reuse(pair.collider1, pair.collider2);

@@ -490,6 +490,21 @@ impl<N, E> Graph<N, E> {
         self.find_edge_undirected(a, b).map(|(ix, _)| ix)
     }
 
+    /// Test adjacency in O(1 + min(degree(a), degree(b))) without changing edge order.
+    pub(crate) fn contains_edge(&self, a: NodeIndex, b: NodeIndex) -> bool {
+        // A region sensor can have thousands of neighbors while a newly inserted shape has
+        // only a few. Scanning only the sensor for every insertion makes growth quadratic.
+        // Any connecting edge belongs to both lists: exhaustion of either proves absence.
+        // Keep find_edge's existing choice among parallel edges unchanged for identity users.
+        let connects = |edge: EdgeReference<'_, E>| {
+            let endpoints = self.edges[edge.id().index()].node;
+            endpoints == [a, b] || endpoints == [b, a]
+        };
+        self.edges(a)
+            .zip(self.edges(b))
+            .any(|(left, right)| connects(left) || connects(right))
+    }
+
     /// Return an iterator over all the edges connecting `a` and `b`, in either direction.
     ///
     /// Unlike [`Self::find_edge`], this yields every parallel edge between the two
@@ -782,5 +797,85 @@ where
 {
     fn eq(&self, rhs: &Self) -> bool {
         self.index == rhs.index && self.weight == rhs.weight
+    }
+}
+
+#[cfg(test)]
+mod distsim_tests {
+    use super::*;
+
+    fn assert_adjacency_matches_edges(graph: &Graph<u32, u32>) {
+        let nodes = (0..=graph.nodes.len() as u32)
+            .map(NodeIndex::new)
+            .chain([NodeIndex::end()])
+            .collect::<Vec<_>>();
+        for &a in &nodes {
+            for &b in &nodes {
+                let expected = graph
+                    .edges
+                    .iter()
+                    .any(|edge| edge.node == [a, b] || edge.node == [b, a]);
+                assert_eq!(graph.contains_edge(a, b), expected, "{a:?} {b:?}");
+                assert_eq!(graph.find_edge(a, b).is_some(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn adjacency_search_preserves_parallel_edges_loops_and_swap_removals() {
+        let mut graph = Graph::with_capacity(24, 128);
+        let nodes: Vec<_> = (0..24).map(|i| graph.add_node(i)).collect();
+        for i in 0..24 {
+            graph.add_edge(nodes[0], nodes[i], i as u32);
+            graph.add_edge(nodes[i], nodes[0], 100 + i as u32);
+            graph.add_edge(nodes[i], nodes[(i * 7 + 3) % 24], 200 + i as u32);
+        }
+        assert_adjacency_matches_edges(&graph);
+        for i in 0..17 {
+            let index = (i * 11) % graph.edges.len();
+            graph.remove_edge(EdgeIndex::new(index as u32));
+            assert_adjacency_matches_edges(&graph);
+        }
+        for index in [0, 7, 2, 16] {
+            graph.remove_node(NodeIndex::new(index));
+            assert_adjacency_matches_edges(&graph);
+        }
+        let fresh = graph.add_node(999);
+        graph.add_edge(fresh, NodeIndex::new(0), 999);
+        graph.add_edge(fresh, fresh, 1000);
+        assert_adjacency_matches_edges(&graph.clone());
+        #[cfg(feature = "serde-serialize")]
+        {
+            let restored = bincode::deserialize(&bincode::serialize(&graph).unwrap()).unwrap();
+            assert_adjacency_matches_edges(&restored);
+        }
+    }
+
+    #[test]
+    #[ignore = "bounded asymptotic diagnostic, not an acceptance timing test"]
+    fn edge_existence_star_scaling_diagnostic() {
+        use std::{hint::black_box, time::Instant};
+        for count in [512, 1024, 2048, 4096] {
+            for bounded in [false, true] {
+                let mut graph = Graph::with_capacity(count + 1, count);
+                let center = graph.add_node(());
+                let began = Instant::now();
+                for _ in 0..black_box(count) {
+                    let leaf = graph.add_node(());
+                    let exists = if bounded {
+                        graph.contains_edge(center, leaf)
+                    } else {
+                        graph.find_edge(center, leaf).is_some()
+                    };
+                    assert!(!black_box(exists));
+                    graph.add_edge(center, leaf, ());
+                }
+                std::println!(
+                    "star nodes={count} bounded={bounded} elapsed_us={}",
+                    began.elapsed().as_micros()
+                );
+                assert_eq!(graph.edges.len(), count);
+            }
+        }
     }
 }
