@@ -5,6 +5,12 @@ recorded in the published `rapier3d` 0.35.1 crate. All 212 packaged source and t
 files match that revision byte for byte. The archive SHA-256 is
 `e1c797fd96e34ae075c7b849741f89968ebedb86b584023420d68a1993bdc5cc`.
 
+The fork's workflow files are retained verbatim from its existing `master`
+(`475caa3ff4646fd9a796b67d14116256f4962bc7`). Publishing this older engine branch
+does not replace the fork's workflow definitions. Those definitions target the
+newer master layout; this branch's validation is the bounded distsim validation
+described below, not a claim that the master's binding jobs run on this branch.
+
 The changes preserve the engine's existing collision and solver policies:
 
 - `broad_phase_bvh` omits pair enumeration when all enabled colliders have empty
