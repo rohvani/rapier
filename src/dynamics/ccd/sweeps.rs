@@ -9,7 +9,7 @@ use crate::math::{Pose, Real, Vector};
 use crate::parry::bounding_volume::Aabb;
 use crate::parry::bounding_volume::BoundingVolume;
 use crate::parry::partitioning::Bvh;
-use crate::pipeline::{ActiveHooks, PairFilterContext, PhysicsHooks};
+use crate::pipeline::{ActiveEvents, ActiveHooks, PairFilterContext, PhysicsHooks};
 #[cfg(feature = "dim2")]
 use parry::query::sweep_toi::CORE_FRACTION;
 use parry::query::sweep_toi::{
@@ -572,6 +572,28 @@ pub(super) fn sweep_fast_body(
                 return;
             }
 
+            if is_pseudo {
+                // distsim: pseudo hits never clamp motion. solve_continuous only emits them
+                // for event-enabled sensors with no initial overlap; reject that same necessary
+                // condition before the expensive sweep. In particular, a fast body already
+                // inside a large region sensor cannot produce a missed through-crossing event.
+                // Keep hooks above, and keep the final clamped-end test in solve_continuous:
+                // an intervening solid impact can change that endpoint after this sweep.
+                if (!co1.is_sensor() && !co2.is_sensor())
+                    || !(co1.flags.active_events | co2.flags.active_events)
+                        .contains(ActiveEvents::COLLISION_EVENTS)
+                    || dispatcher
+                        .intersection_test(
+                            &co1.pos.inv_mul(&co2.pos),
+                            co1.shape.as_ref(),
+                            co2.shape.as_ref(),
+                        )
+                        .unwrap_or(false)
+                {
+                    return;
+                }
+            }
+
             if let Some(hit_fraction) = cast_collider_pair(
                 dispatcher,
                 &fast,
@@ -685,4 +707,129 @@ pub(super) fn map_bodies_parallel<T>(
     f: impl Fn(RigidBodyHandle, &dyn PhysicsHooks) -> T,
 ) -> Vec<T> {
     handles.iter().map(|h| f(*h, hooks)).collect()
+}
+
+#[cfg(all(test, feature = "dim3", feature = "std"))]
+mod distsim_tests {
+    use super::*;
+    use crate::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct CountHooks(AtomicUsize);
+    impl PhysicsHooks for CountHooks {
+        fn filter_contact_pair(&self, _: &PairFilterContext) -> Option<SolverFlags> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Some(SolverFlags::COMPUTE_IMPULSES)
+        }
+    }
+
+    #[test]
+    fn pseudo_sweeps_keep_crossings_and_hooks_without_collecting_discarded_hits() {
+        for (start, events_on_body, events_on_sensor, expected_hits) in [
+            (-3.0, false, true, 1),
+            (-3.0, true, false, 1),
+            (-3.0, false, false, 0),
+            (0.0, false, true, 0),
+        ] {
+            let mut bodies = RigidBodySet::new();
+            let mut colliders = ColliderSet::new();
+            let body = bodies
+                .insert(RigidBodyBuilder::dynamic().translation(Vector::new(start, 0.0, 0.0)));
+            let events = |enabled| {
+                if enabled {
+                    ActiveEvents::COLLISION_EVENTS
+                } else {
+                    ActiveEvents::empty()
+                }
+            };
+            colliders.insert_with_parent(
+                ColliderBuilder::cuboid(0.1, 0.1, 0.1)
+                    .active_hooks(ActiveHooks::FILTER_CONTACT_PAIRS)
+                    .active_events(events(events_on_body)),
+                body,
+                &mut bodies,
+            );
+            let sensor = colliders.insert(
+                ColliderBuilder::cuboid(0.5, 0.5, 0.5)
+                    .sensor(true)
+                    .active_events(events(events_on_sensor)),
+            );
+            let fixed = [(sensor, colliders[sensor].compute_aabb())];
+            let hooks = CountHooks::default();
+            let result = sweep_fast_body(
+                body,
+                &bodies,
+                &colliders,
+                Pose::translation(3.0, 0.0, 0.0),
+                CcdTargets::FixedList(&fixed),
+                &crate::parry::query::DefaultQueryDispatcher,
+                &hooks,
+                1.0 / 60.0,
+                0.001,
+                PseudoHitMode::Record,
+            );
+            assert_eq!(result.fraction, 1.0, "sensors cannot clamp motion");
+            assert_eq!(result.pseudo_hits.len(), expected_hits);
+            assert_eq!(hooks.0.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn continuous_sensor_events_survive_crossings_exits_and_solid_clamps() {
+        // A complete crossing must emit both events in one step. An initially overlapping
+        // body uses the ordinary narrow-phase Started/Stopped path instead. A wall before
+        // the sensor must suppress a crossing that the unclamped trajectory would complete.
+        for bullet in [false, true] {
+            for (start, wall_before, expected_first, expected_final) in
+                [(-3.0, false, 2, 2), (0.0, false, 1, 2), (-3.0, true, 0, 0)]
+            {
+                let mut world = PhysicsWorld::new();
+                world.gravity = Vector::ZERO;
+                let (body, collider) = world.insert(
+                    RigidBodyBuilder::dynamic()
+                        .translation(Vector::new(start, 0.0, 0.0))
+                        .linvel(Vector::new(360.0, 0.0, 0.0))
+                        .ccd_enabled(bullet),
+                    ColliderBuilder::cuboid(0.1, 0.1, 0.1),
+                );
+                let sensor = world.insert_collider(
+                    ColliderBuilder::cuboid(0.5, 0.5, 0.5)
+                        .sensor(true)
+                        .active_events(ActiveEvents::COLLISION_EVENTS),
+                    None,
+                );
+                if wall_before {
+                    world.insert_collider(
+                        ColliderBuilder::cuboid(0.05, 5.0, 5.0)
+                            .translation(Vector::new(-1.0, 0.0, 0.0)),
+                        None,
+                    );
+                }
+                let (event_tx, event_rx) = std::sync::mpsc::channel();
+                let (force_tx, _) = std::sync::mpsc::channel();
+                let events = ChannelEventCollector::new(event_tx, force_tx);
+                world.step_with_events(&(), &events);
+                let mut observed: Vec<_> = event_rx.try_iter().collect();
+                assert_eq!(observed.len(), expected_first);
+                if wall_before {
+                    assert!(world.bodies[body].translation().x < -1.0);
+                } else {
+                    assert!(world.bodies[body].translation().x > 2.0);
+                }
+                world.step_with_events(&(), &events);
+                observed.extend(event_rx.try_iter());
+                assert_eq!(observed.len(), expected_final);
+                if expected_final == 2 {
+                    assert!(observed[0].started());
+                    assert!(observed[1].stopped());
+                    for event in observed {
+                        let pair = [event.collider1(), event.collider2()];
+                        assert!(pair.contains(&collider) && pair.contains(&sensor));
+                        assert!(event.sensor());
+                    }
+                }
+            }
+        }
+    }
 }
