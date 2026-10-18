@@ -1,3 +1,4 @@
+// distsim modification: collision-type edits invalidate cached pair filtering, like group edits.
 use crate::alloc_prelude::*;
 use crate::dynamics::{CoefficientCombineRule, MassProperties, RigidBodyHandle, RigidBodySet};
 #[cfg(feature = "dim3")]
@@ -183,7 +184,12 @@ impl Collider {
 
     /// Sets the collision types enabled for this collider.
     pub fn set_active_collision_types(&mut self, active_collision_types: ActiveCollisionTypes) {
-        self.flags.active_collision_types = active_collision_types;
+        if self.flags.active_collision_types != active_collision_types {
+            // Broad phase filters these types before creating pairs. Rediscover stationary
+            // overlaps after an edit, and let narrow phase retire newly forbidden contacts.
+            self.changes.insert(ColliderChanges::GROUPS);
+            self.flags.active_collision_types = active_collision_types;
+        }
     }
 
     /// The contact skin of this collider.

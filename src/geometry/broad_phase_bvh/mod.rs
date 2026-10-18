@@ -67,6 +67,10 @@ pub struct BroadPhaseBvh {
     /// `update` call (e.g. by the physics pipeline at the end of the previous step).
     /// They count as changed colliders for the next `update` call.
     pending_set_aabb: Vec<ColliderHandle>,
+    /// Cached proof that no enabled collider admits any collision type. Only modified
+    /// colliders can invalidate it; removals cannot. Restore conservatively after snapshots.
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    all_collision_types_disabled: bool,
     /// Quality-degrading tree changes (in-place leaf updates, removals) since the last
     /// incremental optimization; re-inserted leaves don't count (SAH re-insertion is
     /// self-optimizing). Periodic optimization is skipped while small relative to tree size.

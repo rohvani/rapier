@@ -1,6 +1,7 @@
 //! The broad-phase update pass: BVH leaf maintenance (refit-free re-inserts,
 //! partial/full refits, deferred optimization scheduling) plus the pair
 //! creation and stale-pair removal bookkeeping.
+//! distsim modification: omit pair enumeration for an explicitly collision-disabled world.
 
 use super::{BroadPhaseBvh, BvhOptimizationStrategy};
 use crate::alloc_prelude::*;
@@ -300,6 +301,28 @@ impl BroadPhaseBvh {
 
         self.deferred_optimize_pending |= defer_optimize;
 
+        // Query-only worlds still need fresh bounds, but no pair can pass the existing
+        // ActiveCollisionTypes filter if every enabled collider disables every body type.
+        // Normal worlds usually stop at the first collider. Re-enabling a collision type
+        // marks GROUPS and takes the existing forced-reinsertion path above, including
+        // when neither shape moved. Keep stale-pair removal and narrow-phase updates intact.
+        // Once established, maintain this proof from the existing modification frontier.
+        // New/reused slots, collider re-enables, and parent-body re-enables all enter it.
+        // Query-only clients may retain tens of thousands of unchanged sleeping shapes, so
+        // rescanning the whole set here would undo the moving-set cost of BVH maintenance.
+        let admits_pairs = |collider: &Collider| {
+            collider.is_enabled() && !collider.active_collision_types().is_empty()
+        };
+        let can_create_pairs = if self.all_collision_types_disabled {
+            modified_colliders
+                .iter()
+                .filter_map(|handle| colliders.get(*handle))
+                .any(admits_pairs)
+        } else {
+            colliders.iter_enabled().any(|(_, co)| admits_pairs(co))
+        };
+        self.all_collision_types_disabled = !can_create_pairs;
+
         // The tree walk dominates the pair traversal, so walk it in parallel when there are
         // threads for it — parry pins the parallel walk to the sequential walk's exact pair
         // order — then pre-filter the reported pairs with read-only map probes so the
@@ -311,9 +334,12 @@ impl BroadPhaseBvh {
         // the serialized broad-phase state: keeping it would make the two builds' snapshots
         // differ even on an identical simulation.
         #[cfg(feature = "parallel")]
-        let candidates = self
-            .tree
-            .traverse_bvtt_single_tree_parallel::<{ Self::CHANGE_DETECTION_ENABLED }>();
+        let candidates = if can_create_pairs {
+            self.tree
+                .traverse_bvtt_single_tree_parallel::<{ Self::CHANGE_DETECTION_ENABLED }>()
+        } else {
+            Vec::new()
+        };
 
         #[cfg(not(feature = "parallel"))]
         let candidates = {
@@ -322,11 +348,13 @@ impl BroadPhaseBvh {
             // beyond the (amortized) buffer.
             let mut candidates = core::mem::take(&mut self.candidates_scratch);
             candidates.clear();
-            self.tree
-                .traverse_bvtt_single_tree::<{ Self::CHANGE_DETECTION_ENABLED }>(
-                    &mut self.workspace,
-                    &mut |co1, co2| candidates.push((co1, co2)),
-                );
+            if can_create_pairs {
+                self.tree
+                    .traverse_bvtt_single_tree::<{ Self::CHANGE_DETECTION_ENABLED }>(
+                        &mut self.workspace,
+                        &mut |co1, co2| candidates.push((co1, co2)),
+                    );
+            }
             candidates
         };
 
@@ -599,5 +627,168 @@ impl BroadPhaseBvh {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "dim3"))]
+mod distsim_tests {
+    use crate::alloc_prelude::*;
+    use crate::prelude::*;
+
+    #[test]
+    fn disabled_pairs_keep_queries_current_and_reactivate_without_motion() {
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let handles: Vec<_> = (0..32)
+            .map(|_| {
+                colliders.insert(
+                    ColliderBuilder::cuboid(0.5, 0.5, 0.5)
+                        .sensor(true)
+                        .active_collision_types(ActiveCollisionTypes::empty()),
+                )
+            })
+            .collect();
+        let mut islands = IslandManager::new();
+        let mut broad = BroadPhaseBvh::new();
+        let mut narrow = NarrowPhase::new();
+        let mut pipeline = CollisionPipeline::new();
+        macro_rules! step {
+            () => {
+                pipeline.step(
+                    0.002,
+                    &mut islands,
+                    &mut broad,
+                    &mut narrow,
+                    &mut bodies,
+                    &mut colliders,
+                    &(),
+                    &(),
+                )
+            };
+        }
+        let ray_hit = |broad: &BroadPhaseBvh, bodies: &RigidBodySet, colliders: &ColliderSet, x| {
+            broad
+                .as_query_pipeline(
+                    &crate::parry::query::DefaultQueryDispatcher,
+                    bodies,
+                    colliders,
+                    QueryFilter::default(),
+                )
+                .cast_ray(&Ray::new(Vector::new(x, 5.0, 0.0), -Vector::Y), 10.0, true)
+                .map(|(handle, _)| handle)
+        };
+        step!();
+        assert!(ray_hit(&broad, &bodies, &colliders, 0.0).is_some());
+        assert_eq!(narrow.intersection_pairs().count(), 0);
+        #[cfg(not(feature = "parallel"))]
+        assert!(
+            broad.candidates_scratch.is_empty(),
+            "disabled pairs were still enumerated"
+        );
+
+        // One enabled side is sufficient for a pair. Neither collider has moved: the filter
+        // transition alone must rediscover every overlapping sensor through the existing path.
+        colliders[handles[0]].set_active_collision_types(ActiveCollisionTypes::all());
+        step!();
+        assert_eq!(
+            narrow
+                .intersection_pairs()
+                .filter(|(_, _, hit)| *hit)
+                .count(),
+            31
+        );
+        colliders[handles[0]].set_active_collision_types(ActiveCollisionTypes::empty());
+        colliders[handles[0]].set_translation(Vector::new(10.0, 0.0, 0.0));
+        step!();
+        assert_eq!(
+            narrow
+                .intersection_pairs()
+                .filter(|(_, _, hit)| *hit)
+                .count(),
+            0
+        );
+        assert_eq!(ray_hit(&broad, &bodies, &colliders, 10.0), Some(handles[0]));
+        colliders.remove(handles[0], &mut islands, &mut bodies, false);
+        step!();
+        assert_eq!(ray_hit(&broad, &bodies, &colliders, 10.0), None);
+    }
+
+    #[test]
+    fn disabled_pair_cache_tracks_reenabled_parents_colliders_and_reused_slots() {
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        colliders.insert(
+            ColliderBuilder::ball(0.5)
+                .sensor(true)
+                .active_collision_types(ActiveCollisionTypes::empty()),
+        );
+        let parent = bodies.insert(RigidBodyBuilder::fixed().enabled(false));
+        let attached = colliders.insert_with_parent(
+            ColliderBuilder::ball(0.5)
+                .sensor(true)
+                .active_collision_types(ActiveCollisionTypes::all()),
+            parent,
+            &mut bodies,
+        );
+        let mut islands = IslandManager::new();
+        let mut broad = BroadPhaseBvh::new();
+        let mut narrow = NarrowPhase::new();
+        let mut pipeline = CollisionPipeline::new();
+        macro_rules! step {
+            ($pairs:expr) => {{
+                pipeline.step(
+                    0.002,
+                    &mut islands,
+                    &mut broad,
+                    &mut narrow,
+                    &mut bodies,
+                    &mut colliders,
+                    &(),
+                    &(),
+                );
+                assert_eq!(
+                    narrow
+                        .intersection_pairs()
+                        .filter(|(_, _, hit)| *hit)
+                        .count(),
+                    $pairs,
+                );
+                assert_eq!(broad.all_collision_types_disabled, $pairs == 0);
+            }};
+        }
+        step!(0);
+        bodies[parent].set_enabled(true);
+        step!(1);
+        bodies[parent].set_enabled(false);
+        step!(0);
+
+        // A collider explicitly disabled by its user stays disabled when its parent returns.
+        colliders[attached].set_enabled(false);
+        bodies[parent].set_enabled(true);
+        step!(0);
+        colliders[attached].set_enabled(true);
+        step!(1);
+        colliders[attached].set_active_collision_types(ActiveCollisionTypes::empty());
+        step!(0);
+        step!(0);
+        assert!(broad.clone().all_collision_types_disabled);
+
+        #[cfg(feature = "serde-serialize")]
+        {
+            broad = bincode::deserialize(&bincode::serialize(&broad).unwrap()).unwrap();
+            assert!(!broad.all_collision_types_disabled);
+            step!(0);
+        }
+
+        // Arena index reuse must not inherit the removed collider's disabled proof.
+        colliders.remove(attached, &mut islands, &mut bodies, false);
+        let replacement = colliders.insert(
+            ColliderBuilder::ball(0.5)
+                .sensor(true)
+                .active_collision_types(ActiveCollisionTypes::all()),
+        );
+        assert_eq!(attached.into_raw_parts().0, replacement.into_raw_parts().0);
+        assert_ne!(attached, replacement);
+        step!(1);
     }
 }
