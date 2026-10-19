@@ -165,7 +165,6 @@ impl CollisionPipeline {
         hooks: &dyn PhysicsHooks,
         events: &dyn EventHandler,
     ) {
-        let mut modified_bodies = bodies.take_modified();
         let mut modified_colliders = colliders.take_modified();
         let mut removed_colliders = colliders.take_removed();
 
@@ -174,6 +173,10 @@ impl CollisionPipeline {
             colliders,
             &modified_colliders[..],
         );
+        // Collider edits can queue their parents for mass-property/activation updates. Drain
+        // bodies afterward, as PhysicsPipeline does, so these new entries belong to this pass
+        // instead of being overwritten when its original body worklist is returned below.
+        let mut modified_bodies = bodies.take_modified();
         super::user_changes::handle_user_changes_to_rigid_bodies(
             None,
             bodies,
@@ -214,6 +217,51 @@ impl CollisionPipeline {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn collider_edits_refresh_parent_mass_in_the_same_collision_only_pass() {
+        use crate::prelude::*;
+
+        let scene = || {
+            let mut world = PhysicsWorld::new();
+            world.gravity = Vector::ZERO;
+            let handles = world.insert(
+                RigidBodyBuilder::dynamic(),
+                ColliderBuilder::new(SharedShape::new(Cuboid::new(Vector::ONE))).density(2.0),
+            );
+            world.step();
+            (world, handles)
+        };
+        let (mut collision_world, (body, collider)) = scene();
+        let (mut physics_world, reference_handles) = scene();
+        assert_eq!((body, collider), reference_handles);
+        let mut collision_pipeline = CollisionPipeline::new();
+        // A collider edit queues its parent while collider changes are processed. Repeated
+        // edits also detect a lost queue entry whose IN_MODIFIED_SET flag remains stranded.
+        for half in [2.0, 3.0, 1.0] {
+            for world in [&mut collision_world, &mut physics_world] {
+                world.colliders[collider]
+                    .set_shape(SharedShape::new(Cuboid::new(Vector::splat(half))));
+            }
+            physics_world.step();
+            collision_pipeline.step(
+                0.01,
+                &mut collision_world.islands,
+                &mut collision_world.broad_phase,
+                &mut collision_world.narrow_phase,
+                &mut collision_world.bodies,
+                &mut collision_world.colliders,
+                &(),
+                &(),
+            );
+            let expected = 2.0 * (2.0 * half).powi(DIM as i32);
+            assert_eq!(physics_world.bodies[body].mass(), expected);
+            assert_eq!(collision_world.bodies[body].mass(), expected);
+            assert_eq!(
+                collision_world.bodies[body].mass_properties().local_mprops,
+                physics_world.bodies[body].mass_properties().local_mprops
+            );
+        }
+    }
 
     #[test]
     #[cfg(feature = "dim3")]

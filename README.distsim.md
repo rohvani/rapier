@@ -38,6 +38,11 @@ The changes preserve the engine's existing collision and solver policies:
   generations and excludes simulation-driven motion. The physics and collision
   pipelines remain responsible for processing and clearing that queue. Lifecycle,
   clone/snapshot and repeated collision-only-edit fixtures cover its semantics.
+- `CollisionPipeline` takes the modified-body worklist after applying collider edits, matching
+  `PhysicsPipeline`. Collider changes can enqueue their parents for mass-property updates;
+  taking the list earlier lost these entries when the old list was returned at the end of
+  the pass. Repeated resize fixtures compare mass and inertia with full physics, and Distsim's
+  paused-client fixture exercises the Bevy component-edit path before resuming dynamics.
 - `ccd/sweeps.rs` rejects sensor pseudo hits before their sweep when the existing
   continuous pass would necessarily discard them: neither collider is a sensor,
   neither requests collision events, or the exact initial-overlap test succeeds.
