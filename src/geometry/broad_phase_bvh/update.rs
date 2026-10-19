@@ -60,6 +60,10 @@ impl BroadPhaseBvh {
             self.tree.remove(handle.into_raw_parts().0);
             if let Some(mut others) = self.pair_adjacency.remove(handle.0, Vec::new()) {
                 for other in others.drain(..) {
+                    // A raw-index tag must retire before this slot's new generation can
+                    // reach pair discovery. The old generational map entry retires later.
+                    self.known_pairs
+                        .remove(handle.into_raw_parts().0, other.into_raw_parts().0);
                     self.stale_pairs.push((*handle, other, false));
                 }
             }
@@ -366,10 +370,37 @@ impl BroadPhaseBvh {
             candidates
         };
 
+        // Sparse motion keeps the original map path. Dense traversal revisits many known
+        // pairs; an exact tag can reject those before fetching either large Collider value.
+        let use_cached_pairs =
+            candidates.len() >= 512 && self.pairs.len() <= candidates.len().saturating_mul(2);
+        if use_cached_pairs && !self.known_pairs.allocated() {
+            self.known_pairs.allocate();
+            for &(first, second) in self.pairs.keys() {
+                // Initialization follows retirement collection but precedes map deletion.
+                // Never seed a raw-index proof from a removed/reused generation.
+                if colliders.contains(first) && colliders.contains(second) {
+                    self.known_pairs
+                        .insert(first.into_raw_parts().0, second.into_raw_parts().0);
+                }
+            }
+        }
+
         {
             let filter_new =
                 |&(co1, co2): &(u32, u32)| -> Option<(ColliderHandle, ColliderHandle)> {
                     debug_assert_ne!(co1, co2);
+                    if use_cached_pairs && self.known_pairs.contains(co1, co2) {
+                        // Exercise the full generational membership proof in release fixtures
+                        // too. The cache is read-only throughout serial/parallel discovery.
+                        #[cfg(any(test, debug_assertions))]
+                        {
+                            let (_, first) = colliders.get_unknown_gen(co1.min(co2)).unwrap();
+                            let (_, second) = colliders.get_unknown_gen(co1.max(co2)).unwrap();
+                            assert!(self.pairs.contains_key(&(first, second)));
+                        }
+                        return None;
+                    }
                     let (mut collider1, mut handle1) = colliders.get_unknown_gen(co1)?;
                     let (mut collider2, mut handle2) = colliders.get_unknown_gen(co2)?;
 
@@ -450,6 +481,8 @@ impl BroadPhaseBvh {
             for (handle1, handle2) in new_pairs {
                 let prev = self.pairs.insert((handle1, handle2), self.frame_index);
                 debug_assert!(prev.is_none());
+                self.known_pairs
+                    .insert(handle1.into_raw_parts().0, handle2.into_raw_parts().0);
                 self.pair_adjacency
                     .ensure_element_exist(handle1.0, Vec::new())
                     .push(handle2);
@@ -609,6 +642,10 @@ impl BroadPhaseBvh {
             // The `remove` check also deduplicates: the same pair can be pushed twice
             // if both its colliders changed this frame.
             if crate::utils::hashmap_remove(&mut self.pairs, &(h0, h1)).is_some() {
+                // Clearing a tag for a reused raw-index pair may also evict its new
+                // generation's tag. That is a harmless miss; leaving stale proof is not.
+                self.known_pairs
+                    .remove(h0.into_raw_parts().0, h1.into_raw_parts().0);
                 for (ha, hb) in [(h0, h1), (h1, h0)] {
                     if let Some(others) = self.pair_adjacency.get_mut(ha.0) {
                         if let Some(pos) = others.iter().position(|h| *h == hb) {
@@ -634,7 +671,7 @@ mod distsim_tests {
     fn dense_and_sparse_pair_retirement_matches_tree_geometry_across_wrap_and_reuse() {
         let mut bodies = RigidBodySet::new();
         let mut colliders = ColliderSet::new();
-        let mut handles: Vec<_> = (0..32)
+        let mut handles: Vec<_> = (0..64)
             .map(|i| {
                 colliders.insert(
                     ColliderBuilder::cuboid(0.5, 0.5, 0.5)
@@ -674,9 +711,9 @@ mod distsim_tests {
                 assert_ne!(removed, handles[3]);
             }
             let moved = match step % 4 {
-                0 => 32,
+                0 => handles.len(),
                 1 => 1,
-                2 => 16,
+                2 => handles.len() / 2,
                 _ => 0,
             };
             for (i, handle) in handles.iter().enumerate().take(moved) {
@@ -686,7 +723,7 @@ mod distsim_tests {
                     0.0
                 };
                 // Full overlap exercises a high-degree graph as well as ordinary short lists.
-                colliders[*handle].set_translation(if step == 4 {
+                colliders[*handle].set_translation(if step == 4 || step == 16 {
                     Vector::ZERO
                 } else {
                     Vector::new((i % 8) as Real * 0.75 + offset, 0.0, (i / 8) as Real * 0.75)
@@ -702,6 +739,25 @@ mod distsim_tests {
                 &(),
                 &(),
             );
+            if step == 4 {
+                assert!(broad.known_pairs.allocated());
+                assert!(broad.known_pairs.keys().next().is_some());
+            }
+            for (a, b) in broad.known_pairs.keys() {
+                let (_, first) = colliders.get_unknown_gen(a).unwrap();
+                let (_, second) = colliders.get_unknown_gen(b).unwrap();
+                assert!(
+                    broad.pairs.contains_key(&(first, second)),
+                    "stale tag at step {step}"
+                );
+            }
+            #[cfg(feature = "serde-serialize")]
+            if step == 20 {
+                let bytes = bincode::serialize(&broad).unwrap();
+                broad = bincode::deserialize(&bytes).unwrap();
+                assert!(!broad.known_pairs.allocated());
+                assert_eq!(bytes, bincode::serialize(&broad).unwrap());
+            }
             let mut expected = Vec::new();
             for (i, first) in handles.iter().enumerate() {
                 for second in &handles[i + 1..] {
@@ -721,7 +777,7 @@ mod distsim_tests {
                 (a.into_raw_parts(), b.into_raw_parts())
             };
             expected.sort_unstable_by_key(key);
-            if step == 4 {
+            if step == 4 || step == 16 {
                 assert_eq!(expected.len(), handles.len() * (handles.len() - 1) / 2);
             }
             let mut actual: Vec<_> = broad.pairs.keys().copied().collect();

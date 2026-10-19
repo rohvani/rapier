@@ -6,6 +6,7 @@ use crate::math::Real;
 use parry::partitioning::{Bvh, BvhLeafUpdateStatus, BvhWorkspace};
 use parry::utils::hashmap::HashMap;
 
+mod pair_cache;
 mod update;
 
 /// The broad-phase collision detector that quickly filters out distant object pairs.
@@ -32,6 +33,10 @@ pub struct BroadPhaseBvh {
         )
     )]
     pairs: HashMap<(ColliderHandle, ColliderHandle), u32>,
+    // Exact positive membership tags avoid two collider lookups for repeated dense candidates.
+    // Derived and bounded to 512 KiB; restore rebuilds them from the generational pair map.
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    known_pairs: pair_cache::KnownPairCache,
     /// For each collider, the other colliders it currently forms a pair with. Lets
     /// stale-pair detection examine only pairs adjacent to changed colliders instead of
     /// re-scanning the whole `pairs` map (a pair can only stop overlapping if one side changed).

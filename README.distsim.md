@@ -26,6 +26,13 @@ The changes preserve the engine's existing collision and solver policies:
   uses the existing canonical tail and removed colliders emit no duplicate
   removal event. A tree-geometry oracle covers dense/sparse movement, slot reuse,
   and frame-counter wrap; it reproduces the leak on the previous implementation.
+- Dense broad-phase discovery uses a lazy, bounded 512 KiB cache of exact existing-pair tags
+  before fetching colliders. Hash collisions only discard hits. Removal invalidates each
+  old raw-index pair before slot reuse can reach discovery; initialization excludes retired
+  generations, and canonical map deletion invalidates again. The generational pair map remains
+  authoritative. Sparse candidate frontiers use the existing path. The cache is derived,
+  omitted from snapshots, and read-only during parallel filtering. Fixtures check every cached
+  tag against the full pair map through dense/sparse motion, retirement and cold restore.
 - `RigidBodySet::iter_modified` reads the existing pending user-modification
   queue without consuming it or scanning every body. It filters removed handle
   generations and excludes simulation-driven motion. The physics and collision

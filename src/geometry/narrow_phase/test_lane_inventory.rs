@@ -206,3 +206,146 @@ fn snapshot_spatial_partition_inventory() {
         "limitations":"Local overlapping population, including replicas; no global ownership reconstruction, cut implementation, shape reach, support policy, future trajectories or acceptance claim."})
     );
 }
+
+// Read-only attribution of sleep blockers in a captured world. Connected components are
+// independently reconstructed from the persistent contact/joint links; no solver policy changes.
+#[test]
+#[ignore = "requires DISTSIM_PHYSICS_SNAPSHOT from a matching dense capture"]
+fn snapshot_sleep_inventory() {
+    use bincode::Options;
+    use std::collections::BTreeMap;
+    let path = std::env::var("DISTSIM_PHYSICS_SNAPSHOT").unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    assert!(file.metadata().unwrap().len() <= 256 * 1024 * 1024);
+    let world: PhysicsWorld = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(256 * 1024 * 1024)
+        .deserialize_from(std::io::BufReader::new(file))
+        .unwrap();
+    let counts = |handles: &[RigidBodyHandle]| {
+        let mut count = [0usize; 10];
+        for handle in handles {
+            let Some(body) = world.bodies.get(*handle) else {
+                continue;
+            };
+            count[0] += 1;
+            if !body.is_fixed() && !body.is_sleeping() {
+                count[8] += 1;
+                count[9] += usize::from(body.activation().is_eligible_for_sleep());
+            }
+            if !body.is_dynamic() {
+                continue;
+            }
+            count[1] += 1;
+            if body.is_sleeping() {
+                continue;
+            }
+            count[2] += 1;
+            let activation = body.activation();
+            count[3] += usize::from(activation.is_eligible_for_sleep());
+            count[4] += usize::from(
+                activation.normalized_linear_threshold < 0.0 || activation.angular_threshold < 0.0,
+            );
+            let extent = body.mass_properties().max_extent();
+            let threshold =
+                activation.normalized_linear_threshold * world.integration_parameters.length_unit;
+            let drift = crate::geometry::relative_pose_drift(
+                &activation.sleep_prev_pose,
+                body.position(),
+                extent,
+            );
+            count[5] += usize::from(drift * 0.5 < threshold * world.integration_parameters.dt);
+            count[6] +=
+                usize::from(body.linvel().length() + body.angvel().length() * extent < threshold);
+            count[7] += usize::from(activation.time_since_can_sleep > 0.0);
+        }
+        count
+    };
+    fn root(parents: &mut [usize], mut index: usize) -> usize {
+        while parents[index] != index {
+            parents[index] = parents[parents[index]];
+            index = parents[index];
+        }
+        index
+    }
+    let all: Vec<_> = world.bodies.iter().map(|(handle, _)| handle).collect();
+    let mut islands = Vec::new();
+    let mut component_count = 0usize;
+    let mut split_blocked_eligible = 0usize;
+    let mut mixed_blocked_eligible = 0usize;
+    let mut static_boundary_links = 0usize;
+    let mut unmatched_nonfixed_links = 0usize;
+    for (id, island) in world.islands.persistent.islands.iter() {
+        let indices: BTreeMap<_, _> = island
+            .bodies
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (h.into_raw_parts(), i))
+            .collect();
+        let mut parents: Vec<_> = (0..island.bodies.len()).collect();
+        for (a, b) in island
+            .contact_links
+            .iter()
+            .map(|l| (l.body1, l.body2))
+            .chain(island.joint_links.iter().map(|l| (l.body1, l.body2)))
+        {
+            let (Some(&a), Some(&b)) = (
+                indices.get(&a.into_raw_parts()),
+                indices.get(&b.into_raw_parts()),
+            ) else {
+                // Fixed/disabled endpoints are deliberately absent from island membership.
+                let external_is_static = [a, b]
+                    .into_iter()
+                    .filter(|h| !indices.contains_key(&h.into_raw_parts()))
+                    .all(|h| {
+                        world
+                            .bodies
+                            .get(h)
+                            .is_some_and(|b| b.is_fixed() || !b.is_enabled())
+                    });
+                if external_is_static {
+                    static_boundary_links += 1;
+                } else {
+                    unmatched_nonfixed_links += 1;
+                }
+                continue;
+            };
+            let a = root(&mut parents, a);
+            let b = root(&mut parents, b);
+            parents[b] = a;
+        }
+        let mut components: BTreeMap<usize, Vec<RigidBodyHandle>> = BTreeMap::new();
+        for (i, handle) in island.bodies.iter().enumerate() {
+            components
+                .entry(root(&mut parents, i))
+                .or_default()
+                .push(*handle);
+        }
+        component_count += components.len();
+        let component_counts: Vec<_> = components.values().map(|bodies| counts(bodies)).collect();
+        for c in &component_counts {
+            if c[8] > 0 && c[8] == c[9] && island.constraint_remove_count > 0 {
+                split_blocked_eligible += c[3];
+            } else if c[8] != c[9] {
+                mixed_blocked_eligible += c[3];
+            }
+        }
+        islands.push(
+            json!({"id":id,"sleeping":island.sleeping,"bodies":island.bodies.len(),
+            "contact_links":island.contact_links.len(),"joint_links":island.joint_links.len(),
+            "unresolved_removals":island.constraint_remove_count,"counts":counts(&island.bodies),
+            "components":component_counts}),
+        );
+    }
+    islands.sort_by_key(|r| std::cmp::Reverse(r["bodies"].as_u64().unwrap()));
+    let island_count = islands.len();
+    islands.truncate(12);
+    std::println!(
+        "{}",
+        json!({"snapshot":path,"read_only":true,
+        "labels":["bodies","dynamic","awake_dynamic","eligible_awake","sleep_disabled_awake","drift_under_threshold_awake","speed_under_threshold_awake","sleep_progress_awake","awake_nonfixed","eligible_awake_nonfixed"],
+        "counts":counts(&all),"persistent_islands":island_count,"reconstructed_components":component_count,
+        "eligible_blocked_by_dirty_split":split_blocked_eligible,"eligible_in_mixed_component":mixed_blocked_eligible,
+        "static_boundary_links":static_boundary_links,"unmatched_nonfixed_links":unmatched_nonfixed_links,"largest_islands":islands})
+    );
+}
