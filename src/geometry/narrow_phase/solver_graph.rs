@@ -145,7 +145,7 @@ impl NarrowPhase {
         if full_rebuild || self.body_qualify_info.is_empty() {
             self.rebuild_body_qualify_info(islands, bodies);
         }
-        #[cfg(debug_assertions)]
+        #[cfg(any(test, debug_assertions))]
         self.debug_validate_body_qualify_info(islands, bodies);
         let has_multibodies = multibody_joints.iter().next().is_some();
 
@@ -354,18 +354,18 @@ impl NarrowPhase {
             self.force_event_flagged.clear();
         }
 
-        #[cfg(debug_assertions)]
+        #[cfg(any(test, debug_assertions))]
         self.debug_validate_solver_graph(full_rebuild, multibody_joints);
-        #[cfg(debug_assertions)]
+        #[cfg(any(test, debug_assertions))]
         self.debug_validate_force_event_pairs(colliders);
     }
 
-    /// Debug-only: proves the incrementally-maintained force-event pair list
+    /// Test/debug: proves the incrementally-maintained force-event pair list
     /// (and its per-edge back-ref mirror) equals a from-scratch recomputation.
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     fn debug_validate_force_event_pairs(&self, colliders: &ColliderSet) {
         let edges = &self.contact_graph.graph.edges;
-        debug_assert_eq!(self.force_event_pos.len(), edges.len());
+        assert_eq!(self.force_event_pos.len(), edges.len());
         let mut expected: Vec<u32> = Vec::new();
         for (edge, hint) in self.pair_solver_hints.iter().enumerate() {
             let selectable = hint & PAIR_HINT_DYN_BIT != 0 && hint & PAIR_HINT_COUNT_MASK != 0;
@@ -385,14 +385,14 @@ impl NarrowPhase {
         }
         let mut actual = self.force_event_pairs.clone();
         for (i, &edge) in self.force_event_pairs.iter().enumerate() {
-            debug_assert_eq!(
+            assert_eq!(
                 self.force_event_pos[edge as usize], i as u32,
                 "force-event back-ref desync"
             );
         }
         expected.sort_unstable();
         actual.sort_unstable();
-        debug_assert_eq!(actual, expected, "force-event pair list diverged");
+        assert_eq!(actual, expected, "force-event pair list diverged");
     }
 
     /// Removes `edge`'s membership from the force-event pair list (O(1) via the
@@ -698,23 +698,23 @@ impl NarrowPhase {
         }
     }
 
-    /// Debug-only: proves the (possibly cached) body qualification table equals
+    /// Test/debug: proves the (possibly cached) body qualification table equals
     /// a from-scratch rebuild — guards the epoch/validity reasoning that lets
     /// [`Self::maintain_solver_contact_graph`] skip the per-step rebuild.
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     fn debug_validate_body_qualify_info(&mut self, islands: &IslandManager, bodies: &RigidBodySet) {
         let cached = self.body_qualify_info.clone();
         self.rebuild_body_qualify_info(islands, bodies);
-        debug_assert!(
+        assert!(
             cached == self.body_qualify_info,
             "stale cached body qualification table"
         );
     }
 
-    /// Debug-only shadow validator: recomputes the exact solver-active manifold set and
+    /// Test/debug shadow validator: recomputes the exact solver-active manifold set and
     /// asserts the persistent graph holds precisely that set in the right buckets —
     /// proves the incremental maintenance stays exact.
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     fn debug_validate_solver_graph(
         &self,
         full_rebuild: bool,
@@ -805,14 +805,14 @@ impl NarrowPhase {
                     .all(|w| (w[0].edge, w[0].manifold) < (w[1].edge, w[1].manifold))
             };
             for (color, refs) in self.solver_contact_graph.buckets() {
-                debug_assert!(
+                assert!(
                     ordered(refs),
                     "solver contact graph bucket {color} is not in ascending (edge, manifold) \
                      order after a full rebuild: the two rebuild variants no longer agree on \
                      the layout, so the solve order now depends on the build"
                 );
             }
-            debug_assert!(
+            assert!(
                 ordered(self.solver_contact_graph.generic()),
                 "the generic solver-contact list is not in ascending (edge, manifold) order \
                  after a full rebuild"
@@ -821,14 +821,14 @@ impl NarrowPhase {
 
         expected.sort_unstable();
         actual.sort_unstable();
-        debug_assert_eq!(
+        assert_eq!(
             actual.len(),
             expected.len(),
             "solver contact graph size {} != selection size {} (full_rebuild={full_rebuild})",
             actual.len(),
             expected.len()
         );
-        debug_assert!(
+        assert!(
             actual == expected,
             "solver contact graph diverged from the from-scratch selection (full_rebuild={full_rebuild})"
         );

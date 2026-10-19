@@ -21,6 +21,8 @@ mod substep;
 #[cfg(test)]
 mod test;
 #[cfg(test)]
+mod test_active_epoch;
+#[cfg(test)]
 mod test_staged;
 
 /// The main physics simulation engine that runs your physics world forward in time.

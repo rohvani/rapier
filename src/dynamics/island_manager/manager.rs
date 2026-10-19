@@ -28,7 +28,7 @@ use parry::utils::VecMap;
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 #[derive(Clone, Default)]
 pub struct IslandManager {
-    /// Bumped whenever any body's `active_set_id`/island assignment changes, so
+    /// Bumped whenever any body's type, `active_set_id` or island assignment changes, so
     /// the solver's persistent constraint cache can cheaply detect that its cached
     /// solver-body indices went stale.
     pub(crate) active_set_epoch: u32,
@@ -259,10 +259,16 @@ impl IslandManager {
         handle: RigidBodyHandle,
         bodies: &mut RigidBodySet,
     ) {
-        self.bump_active_set_epoch();
         let Some(rb) = bodies.get_mut(handle) else {
             return;
         };
+        // Pose/velocity/property edits of an existing active body do not change solver indices
+        // or dynamic qualification. New members and type changes do; actual sleep/wake,
+        // removal and substep reindexing invalidate at their own membership transitions.
+        // Joint builders have a separate assembly epoch for their value-dependent data.
+        if rb.ids.active_island_id == u32::MAX || rb.changes.contains(RigidBodyChanges::TYPE) {
+            self.bump_active_set_epoch();
+        }
 
         if rb.is_fixed() {
             // A body turned fixed leaves the persistent islands (fixed bodies
