@@ -16,7 +16,12 @@ pub(crate) fn handle_user_changes_to_colliders(
     for handle in modified_colliders {
         // NOTE: we use `get` because the collider may no longer
         //       exist if it has been removed.
-        if let Some(co) = colliders.get_mut_internal(*handle) {
+        if let Some(co) = colliders.colliders.get_mut(handle.0) {
+            if co.changes.contains(ColliderChanges::SHAPE) {
+                // Geometry sharing preserves the authored bits and all invalidation flags.
+                // Position-only updates never search the cache.
+                colliders.cuboid_shapes.share(&mut co.shape);
+            }
             if co.changes.contains(ColliderChanges::PARENT) {
                 if let Some(co_parent) = co.parent {
                     let parent_rb = &bodies[co_parent.handle];

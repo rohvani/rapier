@@ -1,3 +1,4 @@
+use super::cuboid_shape_cache::CuboidShapeCache;
 use crate::alloc_prelude::*;
 use crate::data::arena::Arena;
 use crate::data::{HasModifiedFlag, ModifiedObjects};
@@ -50,6 +51,11 @@ pub struct ColliderSet {
     pub(crate) colliders: Arena<Collider>,
     pub(crate) modified_colliders: ModifiedColliders,
     pub(crate) removed_colliders: Vec<ColliderHandle>,
+    #[cfg_attr(
+        feature = "serde-serialize",
+        serde(skip, default = "CuboidShapeCache::cold")
+    )]
+    pub(crate) cuboid_shapes: CuboidShapeCache,
 }
 
 impl ColliderSet {
@@ -59,6 +65,7 @@ impl ColliderSet {
             colliders: Arena::new(),
             modified_colliders: Default::default(),
             removed_colliders: Vec::new(),
+            cuboid_shapes: CuboidShapeCache::default(),
         }
     }
 
@@ -70,6 +77,7 @@ impl ColliderSet {
             colliders: Arena::with_capacity(capacity),
             modified_colliders: ModifiedColliders::with_capacity(capacity),
             removed_colliders: Vec::new(),
+            cuboid_shapes: CuboidShapeCache::default(),
         }
     }
 
@@ -83,6 +91,7 @@ impl ColliderSet {
     /// [`PhysicsPipeline`](crate::pipeline::PhysicsPipeline), which handles
     /// broadphase updates automatically.
     pub fn take_modified(&mut self) -> ModifiedColliders {
+        self.cuboid_shapes.restore(&mut self.colliders);
         core::mem::take(&mut self.modified_colliders)
     }
 
@@ -166,6 +175,7 @@ impl ColliderSet {
     /// Standalone colliders are useful for sensors or static collision geometry that doesn't need a body.
     pub fn insert(&mut self, coll: impl Into<Collider>) -> ColliderHandle {
         let mut coll = coll.into();
+        self.cuboid_shapes.share(&mut coll.shape);
         // Make sure the internal links are reset, they may not be
         // if this rigid-body was obtained by cloning another one.
         coll.reset_internal_references();
@@ -204,6 +214,7 @@ impl ColliderSet {
         bodies: &mut RigidBodySet,
     ) -> ColliderHandle {
         let mut coll = coll.into();
+        self.cuboid_shapes.share(&mut coll.shape);
         // Make sure the internal links are reset, they may not be
         // if this collider was obtained by cloning another one.
         coll.reset_internal_references();

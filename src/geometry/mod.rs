@@ -293,6 +293,8 @@ mod collider;
 #[cfg(feature = "alloc")]
 mod collider_set;
 #[cfg(feature = "alloc")]
+pub(crate) mod cuboid_shape_cache;
+#[cfg(feature = "alloc")]
 mod mesh_converter;
 
 #[cfg(all(feature = "dim3", feature = "alloc"))]

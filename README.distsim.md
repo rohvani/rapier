@@ -33,6 +33,13 @@ The changes preserve the engine's existing collision and solver policies:
   authoritative. Sparse candidate frontiers use the existing path. The cache is derived,
   omitted from snapshots, and read-only during parallel filtering. Fixtures check every cached
   tag against the full pair map through dense/sparse motion, retirement and cold restore.
+- `ColliderSet` shares bit-identical builtin cuboids through a bounded 32-entry pool. Shape
+  insertion and shape edits consult it; position-only updates do not. Signed zero stays distinct,
+  and invalid dimensions and arbitrary custom shapes retain their original allocations. Geometry
+  mutation keeps `SharedShape`'s copy-on-write behavior. The derived pool is omitted from snapshots
+  and restored once without dirtying collider state. Fixtures cover eviction, independent edits,
+  parent mass refresh in both pipelines and byte-identical snapshot restoration. Sharing reduces
+  backend geometry addresses; Bevy components may still retain their original allocations.
 - `RigidBodySet::iter_modified` reads the existing pending user-modification
   queue without consuming it or scanning every body. It filters removed handle
   generations and excludes simulation-driven motion. The physics and collision
