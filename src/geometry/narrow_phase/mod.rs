@@ -324,6 +324,10 @@ fn collect_pairs_to_update<E>(
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 #[derive(Clone)]
 pub struct NarrowPhase {
+    /// Last contact-update pass only; diagnostics never affect snapshots or solver state.
+    #[cfg(feature = "profiler")]
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    contact_update_counts: [u64; 11],
     #[cfg_attr(
         feature = "serde-serialize",
         serde(skip, default = "crate::geometry::default_persistent_query_dispatcher")
@@ -413,6 +417,17 @@ impl Default for NarrowPhase {
 }
 
 impl NarrowPhase {
+    /// Reasons for reusing a pair or taking the full-update path, in counter order.
+    #[cfg(feature = "profiler")]
+    pub const CONTACT_UPDATE_REASONS: [&'static str; 11] = pair_update::CACHE_REASON_NAMES;
+
+    /// One count per candidate in the last narrow-phase contact-update pass. Parallel
+    /// workers reduce local counts after joining; no atomics or per-pair histories are used.
+    #[cfg(feature = "profiler")]
+    pub fn contact_update_counts(&self) -> &[u64; 11] {
+        &self.contact_update_counts
+    }
+
     /// Creates a new empty narrow-phase.
     pub fn new() -> Self {
         Self::with_query_dispatcher(DefaultQueryDispatcher)
@@ -424,6 +439,8 @@ impl NarrowPhase {
         D: 'static + PersistentQueryDispatcher<ContactManifoldData, ContactData>,
     {
         Self {
+            #[cfg(feature = "profiler")]
+            contact_update_counts: [0; 11],
             query_dispatcher: Arc::new(d),
             contact_graph: InteractionGraph::new(),
             intersection_graph: InteractionGraph::new(),

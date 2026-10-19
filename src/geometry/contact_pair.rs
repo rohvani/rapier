@@ -275,6 +275,17 @@ pub(crate) struct ContactRecycleState {
     /// precomputed at the last full update (it depends on whether the pair had
     /// active contacts, which recycling doesn't change).
     pub max_drift: Real,
+    /// The last full update's solver count survives sleep clearing the dispatch hint.
+    /// Reusing a contact cannot change this count, including a certified empty pair.
+    pub qualified_count: u16,
+    /// First-cuboid face axis which separated an empty pair at its last full update.
+    /// Recheck the current projected intervals when the ordinary pose cache expires.
+    /// A certified empty update advances the reference pose just like a full query, so
+    /// this optimization preserves the existing short speculative-contact reuse interval.
+    pub separating_axis: Option<u8>,
+    /// Prediction including contact skins at the last empty update. Expanding the region
+    /// invalidates its certificate even if the pose cache's ordinary interval has not expired.
+    pub separation_prediction: Real,
 }
 
 /// `cos Δθ` between two world rotations (in 3D, computed from the quaternion dot

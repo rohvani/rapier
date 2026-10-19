@@ -61,6 +61,56 @@ pub(super) const OUTCOME_FULL_COMPOSITE: u8 = 5;
 // incremental reconcile needs, so the graph must be rebuilt from scratch (rare).
 pub(super) const OUTCOME_CLEARED_IN_GRAPH: u8 = 6;
 
+// A single reason per candidate makes cache misses attributable without atomic counters
+// in the pair kernel. Each dispatch worker aggregates locally, then reduces after joining.
+#[derive(Copy, Clone)]
+pub(super) enum CacheReason {
+    Unchanged,
+    PoseReused,
+    SeparationReused,
+    Disabled,
+    NoState,
+    ColliderChanged,
+    Hooks,
+    SoftCcd,
+    PredictionGrew,
+    RelativeDrift,
+    WorldRotation,
+}
+
+#[cfg(feature = "profiler")]
+pub(super) const CACHE_REASON_NAMES: [&str; 11] = [
+    "unchanged",
+    "pose_reused",
+    "separation_reused",
+    "disabled",
+    "no_state",
+    "collider_changed",
+    "hooks",
+    "soft_ccd",
+    "prediction_grew",
+    "relative_drift",
+    "world_rotation",
+];
+
+pub(super) struct PairUpdateResult {
+    pub outcome: u8,
+    #[cfg(feature = "profiler")]
+    pub cache_reason: CacheReason,
+}
+
+impl PairUpdateResult {
+    fn new(outcome: u8, reason: CacheReason) -> Self {
+        #[cfg(not(feature = "profiler"))]
+        let _ = reason;
+        Self {
+            outcome,
+            #[cfg(feature = "profiler")]
+            cache_reason: reason,
+        }
+    }
+}
+
 /// The per-pair contact update shared by `NarrowPhase::compute_contacts`'
 /// single-threaded and parallel dispatch paths; returns an `OUTCOME_*` tag.
 #[allow(clippy::too_many_arguments)]
@@ -82,7 +132,7 @@ pub(super) fn process_pair(
     hints_ptr: &HintsPtr,
     #[cfg(not(feature = "parallel"))] transitions: &mut Vec<PairTransition>,
     #[cfg(feature = "parallel")] snd: &std::sync::mpsc::Sender<PairTransition>,
-) -> u8 {
+) -> PairUpdateResult {
     let pair = &mut edge.weight;
     let co1 = &colliders[pair.collider1];
     let co2 = &colliders[pair.collider2];
@@ -102,13 +152,15 @@ pub(super) fn process_pair(
     {
         // Neither collider was changed by the user nor possibly moved by the
         // simulation (its parent body is asleep or fixed).
-        return OUTCOME_SKIPPED;
+        return PairUpdateResult::new(OUTCOME_SKIPPED, CacheReason::Unchanged);
     }
 
     // Contact recycling: if the relative pose barely moved since the
     // last full update, skip contact determination entirely. Must run before the
     // `has_any_active_contact` walk below (whose result recycling cannot change).
+    let mut cache_reason = CacheReason::Disabled;
     if contact_recycle_distance > 0.0 {
+        cache_reason = CacheReason::NoState;
         if let Some(state) = &pair.recycle_state {
             // Anything beyond a position change (shape, groups, type,
             // enabled flag, ...) requires a full update, as do pairs
@@ -117,34 +169,82 @@ pub(super) fn process_pair(
                 | ColliderChanges::POSITION
                 | ColliderChanges::LOCAL_MASS_PROPERTIES;
             let hooks_involved = !(co1.flags.active_hooks | co2.flags.active_hooks).is_empty();
-
-            if ((co1.changes | co2.changes) & !recycle_safe).is_empty() && !hooks_involved {
+            if !((co1.changes | co2.changes) & !recycle_safe).is_empty() {
+                cache_reason = CacheReason::ColliderChanged;
+            } else if hooks_involved {
+                cache_reason = CacheReason::Hooks;
+            } else {
                 let pos12 = co1.pos.inv_mul(&co2.pos);
-                // Conservative bound on how far any contact point moved in
-                // the pair's local space since the last full update (chord
-                // form, no `atan2`; see `relative_pose_drift`).
+                // First preserve the ordinary pose-recycling decision. Replacing that
+                // interval by a fresh separation verdict would create speculative contacts
+                // earlier and can change gameplay (e.g. whether a support gets knocked out).
                 let drift = crate::geometry::contact_pair::relative_pose_drift(
                     &state.pos12,
                     &pos12,
                     state.max_extent,
                 );
-                // The solver arms and normal are frozen in world space while
-                // recycled, so each body's *absolute* rotation since the
-                // freeze must stay small too (bound: cos Δθ > 0.98).
                 let rot_cos =
                     crate::geometry::contact_pair::relative_rot_cos(&state.rot1, &co1.pos.rotation)
                         .min(crate::geometry::contact_pair::relative_rot_cos(
                             &state.rot2,
                             &co2.pos.rotation,
                         ));
+                let soft_ccd = state.separating_axis.is_some()
+                    && [co1, co2].iter().any(|co| {
+                        co.parent.is_some_and(|parent| {
+                            bodies[parent.handle].soft_ccd_prediction() != 0.0
+                        })
+                    });
+                let prediction = prediction_distance + co1.contact_skin() + co2.contact_skin();
+                let prediction_grew =
+                    state.separating_axis.is_some() && prediction > state.separation_prediction;
+                let mut can_reuse =
+                    drift <= state.max_drift && rot_cos > 0.98 && !soft_ccd && !prediction_grew;
+                cache_reason = if soft_ccd {
+                    CacheReason::SoftCcd
+                } else if prediction_grew {
+                    CacheReason::PredictionGrew
+                } else if drift > state.max_drift {
+                    CacheReason::RelativeDrift
+                } else if rot_cos <= 0.98 {
+                    CacheReason::WorldRotation
+                } else {
+                    CacheReason::PoseReused
+                };
+                if !can_reuse && !soft_ccd {
+                    if let Some(axis) = state.separating_axis {
+                        let separated = co1
+                            .shape
+                            .as_cuboid()
+                            .zip(co2.shape.as_cuboid())
+                            .is_some_and(|(first, second)| {
+                                cuboid_face_separates(first, second, &pos12, axis, prediction)
+                            });
+                        if separated {
+                            // The full query would still be empty. Advance its reference exactly
+                            // as a full empty update would; otherwise repeated tangential motion
+                            // would shift the legacy interval and the eventual contact onset.
+                            let state = pair.recycle_state.as_mut().unwrap();
+                            state.pos12 = pos12;
+                            state.rot1 = co1.pos.rotation;
+                            state.rot2 = co2.pos.rotation;
+                            state.max_drift = contact_recycle_distance.min(prediction_distance);
+                            state.separation_prediction = prediction;
+                            cache_reason = CacheReason::SeparationReused;
+                            can_reuse = true;
+                        }
+                    }
+                }
 
-                if drift <= state.max_drift && rot_cos > 0.98 {
-                    // Recycling can't change the qualified-manifold count: only recompute
-                    // a count-cleared hint (pair slept, or state was deserialized).
+                if can_reuse {
+                    // Recycling cannot change solver qualification. Restore the cached count
+                    // when sleep cleared the dispatch hint; an empty pair has nothing to
+                    // re-admit, so it needs neither a manifold walk nor body-state lookups.
                     // SAFETY: each pair is processed at most once per update (disjoint slots).
                     let mut requalified = false;
                     let hint = unsafe { &mut *hints_ptr.0.add(edge_id as usize) };
-                    if *hint & PAIR_HINT_COUNT_MASK == 0 {
+                    let count = pair.recycle_state.as_ref().unwrap().qualified_count;
+                    if *hint & PAIR_HINT_COUNT_MASK == 0 && count != 0 {
                         let dyn_awake = |co: &crate::geometry::Collider| {
                             co.parent.is_some_and(|p| {
                                 let rb = &bodies[p.handle];
@@ -152,19 +252,21 @@ pub(super) fn process_pair(
                             })
                         };
                         let is_dyn = dyn_awake(co1) || dyn_awake(co2);
-                        *hint = pair_qualified_manifold_count(pair)
-                            | ((is_dyn as u16) * PAIR_HINT_DYN_BIT);
+                        *hint = count | ((is_dyn as u16) * PAIR_HINT_DYN_BIT);
                         // The pair re-entered the selection: the solver graph
                         // must reconcile it even though this is a recycle.
                         requalified =
                             *hint & PAIR_HINT_DYN_BIT != 0 && *hint & PAIR_HINT_COUNT_MASK != 0;
                     }
 
-                    return if requalified {
-                        OUTCOME_RECYCLED_REQUALIFIED
-                    } else {
-                        OUTCOME_RECYCLED
-                    };
+                    return PairUpdateResult::new(
+                        if requalified {
+                            OUTCOME_RECYCLED_REQUALIFIED
+                        } else {
+                            OUTCOME_RECYCLED
+                        },
+                        cache_reason,
+                    );
                 }
             }
         }
@@ -595,13 +697,36 @@ pub(super) fn process_pair(
                     origin_radius(co1).max(origin_radius(co2))
                 }
             };
-            // A pair without contacts has an (unknown) separation larger than
-            // the prediction distance. Cap its recycle window by the
-            // prediction distance so an incoming contact can't be missed.
+            // Preserve the existing pose-based interval for contacts and unsupported shapes.
+            // Empty cuboid pairs can certify separation when that ordinary interval expires.
             let max_drift = if pair.has_any_active_contact() {
                 contact_recycle_distance
             } else {
                 contact_recycle_distance.min(prediction_distance)
+            };
+            let separating_axis = if soft_ccd_prediction1 == 0.0
+                && soft_ccd_prediction2 == 0.0
+                && pair
+                    .manifolds
+                    .iter()
+                    .all(|manifold| manifold.points.is_empty())
+            {
+                co1.shape
+                    .as_cuboid()
+                    .zip(co2.shape.as_cuboid())
+                    .and_then(|(first, second)| {
+                        (0..crate::math::DIM as u8).find(|axis| {
+                            cuboid_face_separates(
+                                first,
+                                second,
+                                &pos12,
+                                *axis,
+                                effective_prediction_distance,
+                            )
+                        })
+                    })
+            } else {
+                None
             };
             pair.recycle_state = Some(crate::geometry::ContactRecycleState {
                 pos12,
@@ -609,6 +734,10 @@ pub(super) fn process_pair(
                 rot2: co2.pos.rotation,
                 max_extent,
                 max_drift,
+                // Final solver qualification is recorded below, after all manifold edits.
+                qualified_count: 0,
+                separating_axis,
+                separation_prediction: effective_prediction_distance,
             });
         }
     }
@@ -640,7 +769,11 @@ pub(super) fn process_pair(
             })
         };
         let is_dyn = dyn_awake(co1) || dyn_awake(co2);
-        let new_hint = pair_qualified_manifold_count(pair) | ((is_dyn as u16) * PAIR_HINT_DYN_BIT);
+        let count = pair_qualified_manifold_count(pair);
+        if let Some(state) = &mut pair.recycle_state {
+            state.qualified_count = count;
+        }
+        let new_hint = count | ((is_dyn as u16) * PAIR_HINT_DYN_BIT);
         // SAFETY: each pair is processed at most once per update, so the
         //         hint slots accessed are disjoint.
         let old_hint = unsafe { *hints_ptr.0.add(edge_id as usize) };
@@ -671,10 +804,53 @@ pub(super) fn process_pair(
     // so signal a full rebuild. Must be checked before the `FULL_CLEAN` shortcut: a
     // surviving manifold can look "clean" while a dropped sibling leaked its graph slot.
     if outcome == OUTCOME_FULL && pair.workspace.is_some() {
-        return OUTCOME_FULL_COMPOSITE;
+        return PairUpdateResult::new(OUTCOME_FULL_COMPOSITE, cache_reason);
     }
     if outcome == OUTCOME_FULL && !membership_changed {
-        return OUTCOME_FULL_CLEAN;
+        return PairUpdateResult::new(OUTCOME_FULL_CLEAN, cache_reason);
     }
-    outcome
+    PairUpdateResult::new(outcome, cache_reason)
 }
+
+/// Test one of the first box's unit face axes, also tested by the stock cuboid SAT query.
+/// Its projected gap is |t_i| - a_i - dot(|R^T e_i|, b). A gap larger than the
+/// prediction region proves no contacts are possible; no other axis need be examined.
+/// Roundoff is charged against the gap, never against collision reach. Near the threshold
+/// or on malformed input, use the full dispatcher rather than accepting an uncertain proof.
+fn cuboid_face_separates(
+    first: &parry::shape::Cuboid,
+    second: &parry::shape::Cuboid,
+    pos12: &crate::math::Pose,
+    axis: u8,
+    prediction: Real,
+) -> bool {
+    if axis as usize >= crate::math::DIM
+        || !first.half_extents.is_finite()
+        || !second.half_extents.is_finite()
+        || !first.half_extents.cmpge(crate::math::Vector::ZERO).all()
+        || !second.half_extents.cmpge(crate::math::Vector::ZERO).all()
+        || !pos12.translation.is_finite()
+        || !prediction.is_finite()
+        || prediction < 0.0
+    {
+        return false;
+    }
+    let axis = axis as usize;
+    let mut direction = crate::math::Vector::ZERO;
+    direction[axis] = 1.0;
+    let radius = (pos12.rotation.inverse() * direction)
+        .abs()
+        .dot(second.half_extents);
+    let gap = pos12.translation[axis].abs() - first.half_extents[axis] - radius;
+    let scale = first.half_extents.max_element()
+        + second.half_extents.max_element()
+        + pos12.translation.abs().max_element()
+        + prediction.abs();
+    gap.is_finite()
+        && scale.is_finite()
+        && gap > prediction + scale.max(1.0) * (32.0 * Real::EPSILON)
+}
+
+#[cfg(all(test, feature = "dim3", feature = "f32"))]
+#[path = "test_separation.rs"]
+mod test_separation;

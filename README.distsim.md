@@ -34,6 +34,27 @@ The changes preserve the engine's existing collision and solver policies:
   An independent edge-array oracle covers parallel edges, self-loops, swap
   removals, clone, and serialization. The ignored `edge_existence_star_scaling_diagnostic`
   compares growth costs without imposing a machine-dependent timing assertion.
+- Empty cuboid contacts retain a certified separating face. After the ordinary
+  pose-recycling interval expires, projecting the current boxes onto that face
+  can prove that another full manifold query would still be empty. The shortcut
+  advances the reference pose exactly as the empty query would. It preserves
+  the original interval before testing the face, so it does not introduce
+  speculative contacts earlier. Shape/filter/hook changes and soft CCD fall back
+  to the existing update. Increased prediction reach invalidates ordinary reuse
+  and requires a fresh separation proof; non-finite values or uncertain separation
+  also fall back. Contact-onset/trajectory, random separation, snapshot,
+  hook and runtime-edit fixtures cover the boundary cases.
+- Recycled contacts keep their solver-qualified manifold count. Sleeping still
+  clears the dispatch hint; waking restores the stored count when an awake
+  dynamic participant exists. Empty pairs avoid re-walking manifolds and bodies
+  to rediscover a zero count. All manifold changes refresh the count after hooks
+  and clustering. The sleep/snapshot/reactivation fixture also checks subsequent
+  return to sleep. These added cache fields belong to this engine revision's
+  snapshot format; use matching builds when exchanging Rapier snapshots.
+- The optional `profiler` feature exposes contact-update reason counts for the
+  last narrow-phase pass. Parallel workers aggregate locally and reduce after
+  joining; the pair loop uses no counter atomics. Counts are diagnostic and do
+  not change event or solver ordering.
 
 The distsim repository pins this branch by commit through `third_party/rapier` and
 patches `rapier3d` to `crates/rapier3d`. Its separate Bevy bridge pin is unchanged.

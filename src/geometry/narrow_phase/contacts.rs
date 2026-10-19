@@ -18,6 +18,15 @@ use crate::math::Real;
 use crate::pipeline::ActiveHooks;
 use crate::pipeline::{ActiveEvents, EventHandler, PhysicsHooks};
 
+#[cfg(feature = "parallel")]
+#[derive(Default)]
+struct PairUpdateStats {
+    dirty: Vec<u32>,
+    force_full_rebuild: bool,
+    #[cfg(feature = "profiler")]
+    counts: [u64; 11],
+}
+
 impl NarrowPhase {
     pub(crate) fn compute_contacts(
         &mut self,
@@ -135,13 +144,22 @@ impl NarrowPhase {
 
         #[cfg(not(feature = "parallel"))]
         {
+            #[cfg(feature = "profiler")]
+            {
+                self.contact_update_counts = [0; 11];
+            }
             let mut process_pair = process_pair;
             let edges = &mut self.contact_graph.graph.edges;
             for (i, id) in update_candidates.iter().enumerate() {
                 if let Some(next_id) = update_candidates.get(i + PREFETCH_AHEAD) {
                     crate::utils::prefetch_read::<2, _>(&edges[*next_id as usize]);
                 }
-                match process_pair(&mut edges[*id as usize], *id) {
+                let result = process_pair(&mut edges[*id as usize], *id);
+                #[cfg(feature = "profiler")]
+                {
+                    self.contact_update_counts[result.cache_reason as usize] += 1;
+                }
+                match result.outcome {
                     OUTCOME_RECYCLED_REQUALIFIED | OUTCOME_FULL => {
                         solver_graph_dirty.push(*id);
                     }
@@ -171,7 +189,7 @@ impl NarrowPhase {
             // Broadcast parallel-for: one broadcast wakes all pool threads at once, then they race
             // a shared cursor for fixed blocks (rayon's split-and-steal ramp-up costs more than the update).
             let process_block =
-                |stats: &mut (Vec<u32>, bool), chunk: &[u32], hooks: &dyn PhysicsHooks| {
+                |stats: &mut PairUpdateStats, chunk: &[u32], hooks: &dyn PhysicsHooks| {
                     for (i, id) in chunk.iter().enumerate() {
                         if let Some(next_id) = chunk.get(i + PREFETCH_AHEAD) {
                             crate::utils::prefetch_read::<2, _>(
@@ -181,13 +199,18 @@ impl NarrowPhase {
                         // SAFETY: `update_candidates` is deduplicated, so each edge is
                         //         accessed by exactly one iteration.
                         let edge = unsafe { &mut *edges_ptr.add(*id as usize) };
-                        match process_pair(edge, *id, hooks) {
+                        let result = process_pair(edge, *id, hooks);
+                        #[cfg(feature = "profiler")]
+                        {
+                            stats.counts[result.cache_reason as usize] += 1;
+                        }
+                        match result.outcome {
                             OUTCOME_RECYCLED_REQUALIFIED | OUTCOME_FULL => {
-                                stats.0.push(*id);
+                                stats.dirty.push(*id);
                             }
                             OUTCOME_FULL_COMPOSITE | OUTCOME_CLEARED_IN_GRAPH => {
-                                stats.0.push(*id);
-                                stats.1 = true;
+                                stats.dirty.push(*id);
+                                stats.force_full_rebuild = true;
                             }
                             _ => {}
                         }
@@ -222,11 +245,11 @@ impl NarrowPhase {
 
             const BLOCK: usize = 64;
             #[allow(unused_mut)]
-            let (mut dirty, mut force_full_rebuild) = if update_candidates.len() > BLOCK {
+            let mut stats = if update_candidates.len() > BLOCK {
                 let cursor = core::sync::atomic::AtomicUsize::new(0);
                 let candidates = &update_candidates[..];
                 let per_thread = rayon::broadcast(|_| {
-                    let mut stats = (Vec::new(), false);
+                    let mut stats = PairUpdateStats::default();
                     loop {
                         let start = cursor.fetch_add(BLOCK, core::sync::atomic::Ordering::Relaxed);
                         if start >= candidates.len() {
@@ -239,29 +262,35 @@ impl NarrowPhase {
                 });
                 per_thread
                     .into_iter()
-                    .fold((Vec::new(), false), |mut a, mut b| {
-                        a.0.append(&mut b.0);
-                        a.1 |= b.1;
+                    .fold(PairUpdateStats::default(), |mut a, mut b| {
+                        a.dirty.append(&mut b.dirty);
+                        a.force_full_rebuild |= b.force_full_rebuild;
+                        #[cfg(feature = "profiler")]
+                        for (a, b) in a.counts.iter_mut().zip(b.counts) {
+                            *a += b;
+                        }
                         a
                     })
             } else {
-                let mut stats = (Vec::new(), false);
+                let mut stats = PairUpdateStats::default();
                 process_block(&mut stats, &update_candidates, worker_hooks);
                 stats
             };
             // The pairs held back above, on this thread: the only place a user hook runs.
             #[cfg(feature = "unsync-callbacks")]
             {
-                let mut stats = (dirty, force_full_rebuild);
                 process_block(&mut stats, &hooked, hooks);
-                (dirty, force_full_rebuild) = stats;
                 update_candidates.extend_from_slice(&hooked);
             }
             // The reduce order is scheduler-dependent: sort so the fully-updated
             // edge list is deterministic.
-            dirty.sort_unstable();
-            self.solver_graph_dirty = dirty;
-            if force_full_rebuild {
+            stats.dirty.sort_unstable();
+            self.solver_graph_dirty = stats.dirty;
+            #[cfg(feature = "profiler")]
+            {
+                self.contact_update_counts = stats.counts;
+            }
+            if stats.force_full_rebuild {
                 // A composite pair rebuilt its manifolds: invalidate the graph so
                 // the next maintenance pass rebuilds it from scratch.
                 self.solver_graph_valid = false;
