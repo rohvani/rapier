@@ -20,6 +20,17 @@ The changes preserve the engine's existing collision and solver policies:
   filter changes, so stationary pairs reactivate correctly. Fixtures exercise
   movement, removal, parent/collider re-enabling, clone, serialization, and reused
   arena slots.
+- Removed colliders' broad-phase adjacency is captured before new pairs can
+  reuse the same arena slot. Otherwise a new generation can replace the old
+  adjacency and strand old-generation pairs in the map. Pair-map deletion still
+  uses the existing canonical tail and removed colliders emit no duplicate
+  removal event. A tree-geometry oracle covers dense/sparse movement, slot reuse,
+  and frame-counter wrap; it reproduces the leak on the previous implementation.
+- `RigidBodySet::iter_modified` reads the existing pending user-modification
+  queue without consuming it or scanning every body. It filters removed handle
+  generations and excludes simulation-driven motion. The physics and collision
+  pipelines remain responsible for processing and clearing that queue. Lifecycle,
+  clone/snapshot and repeated collision-only-edit fixtures cover its semantics.
 - `ccd/sweeps.rs` rejects sensor pseudo hits before their sweep when the existing
   continuous pass would necessarily discard them: neither collider is a sensor,
   neither requests collision events, or the exact initial-overlap test succeeds.

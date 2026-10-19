@@ -134,3 +134,75 @@ fn snapshot_contact_drift_inventory() {
         }
     }
 }
+
+// Diagnostic only: inspect the captured local population, without stepping or treating
+// its foreign mirrors as an authoritative global scene. Run under the ordinary runtime cap.
+#[test]
+#[ignore = "requires DISTSIM_PHYSICS_SNAPSHOT from a matching dense capture"]
+fn snapshot_spatial_partition_inventory() {
+    use bincode::Options;
+    let path = std::env::var("DISTSIM_PHYSICS_SNAPSHOT").unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    assert!(file.metadata().unwrap().len() <= 256 * 1024 * 1024);
+    let world: PhysicsWorld = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(256 * 1024 * 1024)
+        .deserialize_from(std::io::BufReader::new(file))
+        .unwrap();
+    let bodies: Vec<_> = world
+        .bodies
+        .iter()
+        .filter(|(_, body)| body.is_enabled() && body.is_dynamic())
+        .collect();
+    assert!(!bodies.is_empty());
+    let quantiles = |mut values: Vec<Real>| {
+        values.sort_by(Real::total_cmp);
+        [0.0, 0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0]
+            .map(|q| values[(q * (values.len() - 1) as f64).round() as usize])
+    };
+    let mut axes = Vec::new();
+    for axis in 0..3 {
+        let positions = quantiles(bodies.iter().map(|(_, b)| b.translation()[axis]).collect());
+        let speeds = quantiles(bodies.iter().map(|(_, b)| b.linvel()[axis].abs()).collect());
+        let plane = positions[4];
+        let near_plane: Vec<_> = bodies
+            .iter()
+            .filter(|(_, b)| (b.translation()[axis] - plane).abs() <= 0.5)
+            .collect();
+        let mut crossing_pairs = 0;
+        let mut crossing_active_pairs = 0;
+        for pair in world.narrow_phase.contact_pairs() {
+            let (Some(first), Some(second)) = (
+                world.colliders.get(pair.collider1),
+                world.colliders.get(pair.collider2),
+            ) else {
+                continue;
+            };
+            let (Some(first), Some(second)) = (first.parent(), second.parent()) else {
+                continue;
+            };
+            let (Some(first), Some(second)) = (world.bodies.get(first), world.bodies.get(second))
+            else {
+                continue;
+            };
+            if first.is_dynamic()
+                && second.is_dynamic()
+                && (first.translation()[axis] < plane) != (second.translation()[axis] < plane)
+            {
+                crossing_pairs += 1;
+                crossing_active_pairs += usize::from(pair.has_any_active_contact());
+            }
+        }
+        axes.push(json!({"axis":axis,"position_quantiles":positions,"absolute_speed_quantiles":speeds,
+            "median_plane":plane,"bodies_within_half_metre_of_plane":near_plane.len(),
+            "sum_absolute_speed_in_one_metre_slab":near_plane.iter().map(|(_, b)| b.linvel()[axis].abs()).sum::<Real>(),
+            "crossing_dynamic_pairs":crossing_pairs,"crossing_active_dynamic_pairs":crossing_active_pairs}));
+    }
+    std::println!(
+        "{}",
+        json!({"snapshot":path,"dynamic_bodies":bodies.len(),
+        "awake_dynamic_bodies":bodies.iter().filter(|(_, b)| !b.is_sleeping()).count(),
+        "quantiles":[0,0.01,0.1,0.25,0.5,0.75,0.9,0.99,1],"axes":axes,
+        "limitations":"Local overlapping population, including replicas; no global ownership reconstruction, cut implementation, shape reach, support policy, future trajectories or acceptance claim."})
+    );
+}

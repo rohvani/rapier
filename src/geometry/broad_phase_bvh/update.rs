@@ -51,10 +51,18 @@ impl BroadPhaseBvh {
             super::run_bvh_optimize(&mut self.tree, &mut self.workspace);
         }
 
-        // Removals must be handled first, in case another collider in
-        // `modified_colliders` shares the same index.
+        // Capture retired adjacency before a new generation can reuse its arena slot.
+        // New-pair insertion below replaces that slot's adjacency; collecting removals later
+        // would lose the old generation's pairs. Defer map deletion to the canonical tail so
+        // graph/event ordering stays unchanged. The narrow phase handles removed colliders.
+        self.stale_pairs.clear();
         for handle in removed_colliders {
             self.tree.remove(handle.into_raw_parts().0);
+            if let Some(mut others) = self.pair_adjacency.remove(handle.0, Vec::new()) {
+                for other in others.drain(..) {
+                    self.stale_pairs.push((*handle, other, false));
+                }
+            }
         }
 
         let first_pass = self.tree.is_empty();
@@ -473,19 +481,6 @@ impl BroadPhaseBvh {
         // refreshed by the sequential pair collector — a map write the parallel collector
         // cannot do, and part of the serialized broad-phase state. One scan for every
         // build is both simpler and what the parallel build already did.)
-        self.stale_pairs.clear();
-
-        // Pairs involving a removed collider are always dropped (without emitting an
-        // event, matching the behavior of the narrow-phase which handles removed
-        // colliders on its own).
-        for handle in removed_colliders {
-            if let Some(mut others) = self.pair_adjacency.remove(handle.0, Vec::new()) {
-                for other in others.drain(..) {
-                    self.stale_pairs.push((*handle, other, false));
-                }
-            }
-        }
-
         // Adjacency scan: pure read-only lookups, stale candidates flattened in `updated_colliders`
         // order (deterministic). No map probe: adjacency membership implies map membership, and the
         // sequential application tolerates duplicates via `pairs.remove`. No timestamp fast-path —
@@ -634,6 +629,151 @@ impl BroadPhaseBvh {
 mod distsim_tests {
     use crate::alloc_prelude::*;
     use crate::prelude::*;
+
+    #[test]
+    fn dense_and_sparse_pair_retirement_matches_tree_geometry_across_wrap_and_reuse() {
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let mut handles: Vec<_> = (0..32)
+            .map(|i| {
+                colliders.insert(
+                    ColliderBuilder::cuboid(0.5, 0.5, 0.5)
+                        .translation(Vector::new(
+                            (i % 8) as Real * 0.75,
+                            0.0,
+                            (i / 8) as Real * 0.75,
+                        ))
+                        .sensor(true)
+                        .active_collision_types(ActiveCollisionTypes::all()),
+                )
+            })
+            .collect();
+        let mut islands = IslandManager::new();
+        let mut broad = BroadPhaseBvh::new();
+        let mut narrow = NarrowPhase::new();
+        let mut pipeline = CollisionPipeline::new();
+        for step in 0..36 {
+            if step == 8 {
+                // Old stamp zero must not masquerade as a current overlap after wrap.
+                broad.frame_index = u32::MAX;
+                for stamp in broad.pairs.values_mut() {
+                    *stamp = 0;
+                }
+            }
+            if step == 16 {
+                let removed = handles[3];
+                colliders
+                    .remove(removed, &mut islands, &mut bodies, false)
+                    .unwrap();
+                handles[3] = colliders.insert(
+                    ColliderBuilder::cuboid(0.5, 0.5, 0.5)
+                        .sensor(true)
+                        .active_collision_types(ActiveCollisionTypes::all()),
+                );
+                assert_eq!(removed.into_raw_parts().0, handles[3].into_raw_parts().0);
+                assert_ne!(removed, handles[3]);
+            }
+            let moved = match step % 4 {
+                0 => 32,
+                1 => 1,
+                2 => 16,
+                _ => 0,
+            };
+            for (i, handle) in handles.iter().enumerate().take(moved) {
+                let offset = if step % 8 < 4 {
+                    (i % 2) as Real * 3.0
+                } else {
+                    0.0
+                };
+                // Full overlap exercises a high-degree graph as well as ordinary short lists.
+                colliders[*handle].set_translation(if step == 4 {
+                    Vector::ZERO
+                } else {
+                    Vector::new((i % 8) as Real * 0.75 + offset, 0.0, (i / 8) as Real * 0.75)
+                });
+            }
+            pipeline.step(
+                0.002,
+                &mut islands,
+                &mut broad,
+                &mut narrow,
+                &mut bodies,
+                &mut colliders,
+                &(),
+                &(),
+            );
+            let mut expected = Vec::new();
+            for (i, first) in handles.iter().enumerate() {
+                for second in &handles[i + 1..] {
+                    let a = broad.tree.leaf_node(first.into_raw_parts().0).unwrap();
+                    let b = broad.tree.leaf_node(second.into_raw_parts().0).unwrap();
+                    if a.intersects(b) {
+                        let pair = if first.into_raw_parts().0 < second.into_raw_parts().0 {
+                            (*first, *second)
+                        } else {
+                            (*second, *first)
+                        };
+                        expected.push(pair);
+                    }
+                }
+            }
+            let key = |&(a, b): &(ColliderHandle, ColliderHandle)| {
+                (a.into_raw_parts(), b.into_raw_parts())
+            };
+            expected.sort_unstable_by_key(key);
+            if step == 4 {
+                assert_eq!(expected.len(), handles.len() * (handles.len() - 1) / 2);
+            }
+            let mut actual: Vec<_> = broad.pairs.keys().copied().collect();
+            actual.sort_unstable_by_key(key);
+            assert_eq!(
+                actual, expected,
+                "stale pair or missed overlap at step {step}"
+            );
+            // Pair retirement requires exact, symmetric, duplicate-free adjacency
+            // after sparse moves, removals and arena generation reuse, not just a correct map.
+            for handle in &handles {
+                let mut adjacent = broad
+                    .pair_adjacency
+                    .get(handle.0)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut expected_neighbors: Vec<_> = expected
+                    .iter()
+                    .filter_map(|&(a, b)| {
+                        if a == *handle {
+                            Some(b)
+                        } else if b == *handle {
+                            Some(a)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                adjacent.sort_unstable_by_key(|h| h.into_raw_parts());
+                expected_neighbors.sort_unstable_by_key(|h| h.into_raw_parts());
+                assert_eq!(
+                    adjacent, expected_neighbors,
+                    "adjacency differs at step {step}"
+                );
+            }
+            let mut events: Vec<_> = narrow
+                .intersection_pairs()
+                .map(|(a, b, _)| {
+                    if a.into_raw_parts().0 < b.into_raw_parts().0 {
+                        (a, b)
+                    } else {
+                        (b, a)
+                    }
+                })
+                .collect();
+            events.sort_unstable_by_key(key);
+            assert_eq!(
+                events, expected,
+                "pair events must update the narrow phase at step {step}"
+            );
+        }
+    }
 
     #[test]
     fn disabled_pairs_keep_queries_current_and_reactivate_without_motion() {

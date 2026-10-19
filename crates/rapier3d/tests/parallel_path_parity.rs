@@ -26,7 +26,9 @@ use rapier3d::prelude::*;
 
 /// Golden hash of [`run`]. Identical in every build; re-mint (with a note saying why)
 /// only when a change is *meant* to alter the simulation.
-const GOLDEN: u64 = 0x0c46_183e_4fbf_cfbb;
+/// Includes the fork's serialized contact-recycling count and separating-face cache.
+/// Both feature modes must preserve the same stored state as well as the same motion.
+const GOLDEN: u64 = 0xa0bd_b932_60a1_b109;
 
 /// FNV-1a.
 struct Fnv(u64);

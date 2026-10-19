@@ -374,6 +374,18 @@ impl RigidBodySet {
         self.bodies.iter().map(|(h, b)| (RigidBodyHandle(h), b))
     }
 
+    /// Iterates over bodies with pending user modifications for the next pipeline step.
+    ///
+    /// This reads the existing modification queue without consuming it. Insertion and tracked
+    /// mutable access enqueue bodies; simulation-driven motion does not. Removed handles are
+    /// skipped, including when their arena slot has since been reused by another generation.
+    /// A physics or collision pipeline step processes and clears this queue.
+    pub fn iter_modified(&self) -> impl Iterator<Item = (RigidBodyHandle, &RigidBody)> {
+        self.modified_bodies
+            .iter()
+            .filter_map(|handle| self.get(*handle).map(|body| (*handle, body)))
+    }
+
     /// Iterates over all rigid bodies with mutable access.
     ///
     /// Each iteration yields a `(handle, &mut RigidBody)` pair. Use this to modify
@@ -448,5 +460,78 @@ impl IndexMut<RigidBodyHandle> for RigidBodySet {
         let rb = &mut self.bodies[handle.0];
         self.modified_bodies.push_once(handle, rb);
         rb
+    }
+}
+
+#[cfg(all(test, not(feature = "dev-remove-slow-accessors")))]
+mod tests {
+    use crate::alloc_prelude::*;
+    use crate::prelude::*;
+
+    fn pending(bodies: &RigidBodySet) -> Vec<RigidBodyHandle> {
+        bodies.iter_modified().map(|(handle, _)| handle).collect()
+    }
+
+    #[test]
+    fn modified_iteration_preserves_pending_work_and_filters_reused_slots() {
+        let mut world = PhysicsWorld::default();
+        let moving = world.insert_body(RigidBodyBuilder::kinematic_position_based());
+        let removed = world.insert_body(RigidBodyBuilder::dynamic());
+        assert_eq!(pending(&world.bodies), vec![moving, removed]);
+        world.step();
+        assert!(pending(&world.bodies).is_empty());
+
+        world.bodies[moving].set_next_kinematic_translation(Vector::X);
+        world.bodies[moving].set_next_kinematic_translation(Vector::X * 2.0);
+        world.bodies[removed].set_enabled(false);
+        world.remove_body(removed).unwrap();
+        let replacement = world.insert_body(RigidBodyBuilder::fixed());
+        assert_eq!(removed.into_raw_parts().0, replacement.into_raw_parts().0);
+        assert_ne!(removed, replacement);
+        let expected = vec![moving, replacement];
+        assert_eq!(pending(&world.bodies), expected);
+        assert_eq!(
+            pending(&world.bodies),
+            expected,
+            "reads must not drain work"
+        );
+        assert_eq!(pending(&world.bodies.clone()), expected);
+        #[cfg(feature = "serde-serialize")]
+        {
+            let bytes = bincode::serialize(&world.bodies).unwrap();
+            let restored: RigidBodySet = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(pending(&restored), expected);
+        }
+
+        world.step();
+        assert_eq!(world.bodies[moving].translation(), Vector::X * 2.0);
+        assert!(pending(&world.bodies).is_empty());
+    }
+
+    #[test]
+    fn modified_iteration_leaves_repeated_collision_only_edits_visible() {
+        let mut world = PhysicsWorld::default();
+        let body = world.insert_body(RigidBodyBuilder::kinematic_position_based());
+        let collider =
+            world
+                .colliders
+                .insert_with_parent(ColliderBuilder::ball(0.5), body, &mut world.bodies);
+        let mut pipeline = CollisionPipeline::new();
+        for x in [1.0, 2.0, 3.0] {
+            world.bodies[body].set_translation(Vector::X * x, false);
+            assert_eq!(pending(&world.bodies), vec![body]);
+            pipeline.step(
+                0.002,
+                &mut world.islands,
+                &mut world.broad_phase,
+                &mut world.narrow_phase,
+                &mut world.bodies,
+                &mut world.colliders,
+                &(),
+                &(),
+            );
+            assert!(pending(&world.bodies).is_empty());
+            assert_eq!(world.colliders[collider].translation(), Vector::X * x);
+        }
     }
 }
