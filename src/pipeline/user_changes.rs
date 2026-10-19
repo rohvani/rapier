@@ -56,6 +56,7 @@ pub(crate) fn handle_user_changes_to_rigid_bodies(
     multibody_joints: &mut MultibodyJointSet, // FIXME: propagate disabled state to multibodies
     modified_bodies: &[RigidBodyHandle],
     modified_colliders: &mut ModifiedColliders,
+    kinematic_target_prefix: usize,
 ) {
     enum FinalAction {
         RemoveFromIsland,
@@ -63,7 +64,7 @@ pub(crate) fn handle_user_changes_to_rigid_bodies(
 
     let mut any_jointed_body_modified = false;
 
-    for handle in modified_bodies {
+    for (index, handle) in modified_bodies.iter().enumerate() {
         let mut final_action = None;
         let type_changed;
 
@@ -80,6 +81,16 @@ pub(crate) fn handle_user_changes_to_rigid_bodies(
 
         {
             let rb = bodies.index_mut_internal(*handle);
+            if index < kinematic_target_prefix
+                && rb.is_kinematic()
+                && rb.pos.position != rb.pos.next_position
+            {
+                // An explicit collision-only caller accepts pending targets without integrating.
+                // Match set_position(next, false), but let the ordinary refresh below compute
+                // world mass once. No caller can observe the intermediate state in this pass.
+                rb.pos.position = rb.pos.next_position;
+                rb.changes.insert(RigidBodyChanges::POSITION);
+            }
             let changes = rb.changes;
             let activation = rb.activation;
 

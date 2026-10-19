@@ -321,6 +321,7 @@ impl PhysicsPipeline {
             multibody_joints,
             &modified_bodies,
             &mut modified_colliders,
+            0, // Dynamics accepts kinematic targets during its ordinary integration.
         );
 
         // Disabled colliders are treated as if they were removed.

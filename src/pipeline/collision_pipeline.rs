@@ -165,6 +165,68 @@ impl CollisionPipeline {
         hooks: &dyn PhysicsHooks,
         events: &dyn EventHandler,
     ) {
+        self.step_impl(
+            prediction_distance,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            hooks,
+            events,
+            false,
+        );
+    }
+
+    /// Refresh collision queries after accepting the pending targets of modified kinematic bodies.
+    ///
+    /// This matches calling `set_position(*body.next_position(), false)` on each already-modified
+    /// kinematic body before [`Self::step`]. It does not integrate dynamics or advance time.
+    /// Targets whose modification queue was consumed by an earlier step remain untouched; callers
+    /// switching from dynamics must reconcile those targets separately on that transition.
+    pub fn step_with_kinematic_targets(
+        &mut self,
+        prediction_distance: Real,
+        islands: &mut IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        hooks: &dyn PhysicsHooks,
+        events: &dyn EventHandler,
+    ) {
+        self.step_impl(
+            prediction_distance,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            hooks,
+            events,
+            true,
+        );
+    }
+
+    fn step_impl(
+        &mut self,
+        prediction_distance: Real,
+        islands: &mut IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        hooks: &dyn PhysicsHooks,
+        events: &dyn EventHandler,
+        accept_kinematic_targets: bool,
+    ) {
+        // Collider edits can append parents to the body frontier. They must not cause acceptance
+        // of a target that was not pending at entry, so capture the original prefix first.
+        let kinematic_target_prefix = if accept_kinematic_targets {
+            bodies.modified_bodies.len()
+        } else {
+            0
+        };
         let mut modified_colliders = colliders.take_modified();
         let mut removed_colliders = colliders.take_removed();
 
@@ -185,6 +247,7 @@ impl CollisionPipeline {
             &mut MultibodyJointSet::new(),
             &modified_bodies,
             &mut modified_colliders,
+            kinematic_target_prefix,
         );
 
         // Disabled colliders are treated as if they were removed.
@@ -217,6 +280,179 @@ impl CollisionPipeline {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "serde-serialize")]
+    use crate::alloc_prelude::Vec;
+
+    #[cfg(feature = "serde-serialize")]
+    fn target_query_step(world: &mut crate::prelude::PhysicsWorld, fused: bool) {
+        use crate::prelude::*;
+        let mut pipeline = CollisionPipeline::new();
+        if !fused {
+            let targets: Vec<_> = world
+                .bodies
+                .iter_modified()
+                .filter_map(|(handle, body)| {
+                    (body.is_kinematic() && body.position() != body.next_position())
+                        .then_some((handle, *body.next_position()))
+                })
+                .collect();
+            for (handle, pose) in targets {
+                world.bodies[handle].set_position(pose, false);
+            }
+        }
+        let step = if fused {
+            CollisionPipeline::step_with_kinematic_targets
+        } else {
+            CollisionPipeline::step
+        };
+        step(
+            &mut pipeline,
+            0.01,
+            &mut world.islands,
+            &mut world.broad_phase,
+            &mut world.narrow_phase,
+            &mut world.bodies,
+            &mut world.colliders,
+            &(),
+            &(),
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "serde-serialize")]
+    fn fused_targets_match_manual_commit_across_topology_and_mass_edits() {
+        use crate::prelude::*;
+        let mut seed = PhysicsWorld::new();
+        let kinds = [
+            RigidBodyType::Dynamic,
+            RigidBodyType::Fixed,
+            RigidBodyType::KinematicPositionBased,
+            RigidBodyType::KinematicVelocityBased,
+        ];
+        let handles: Vec<_> = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(i, kind)| {
+                seed.insert(
+                    RigidBodyBuilder::new(kind).translation(Vector::splat(i as Real * 3.0)),
+                    ColliderBuilder::ball(0.7)
+                        .translation(Vector::Y * 0.3)
+                        .density(2.0),
+                )
+            })
+            .collect();
+        // Deserialize identical arenas/maps, including the same pending modification order.
+        let bytes = bincode::serialize(&seed).unwrap();
+        let mut control: PhysicsWorld = bincode::deserialize(&bytes).unwrap();
+        let mut candidate: PhysicsWorld = bincode::deserialize(&bytes).unwrap();
+        for frame in 0..8 {
+            for world in [&mut control, &mut candidate] {
+                for (index, &(body, collider)) in handles.iter().enumerate() {
+                    let translation =
+                        Vector::X * (frame as Real * 0.1 + index as Real) + Vector::Y * 0.25;
+                    #[cfg(feature = "dim2")]
+                    let target = Pose::new(translation, frame as Real * 0.17);
+                    #[cfg(feature = "dim3")]
+                    let target =
+                        Pose::new(translation, Vector::new(0.11, 0.17, -0.09) * frame as Real);
+                    world.bodies[body].set_next_kinematic_position(target);
+                    if frame == 2 {
+                        world.colliders[collider].set_density(4.0);
+                    }
+                    if frame == 3 {
+                        world.bodies[body].set_enabled(false);
+                    }
+                    if frame == 4 {
+                        world.bodies[body].set_enabled(true);
+                        world.bodies[body].set_locked_axes(LockedAxes::ROTATION_LOCKED_Z, false);
+                        world.bodies[body].set_body_type(kinds[(index + 1) % kinds.len()], false);
+                    }
+                }
+                if frame == 5 {
+                    world
+                        .colliders
+                        .set_parent(handles[0].1, Some(handles[2].0), &mut world.bodies);
+                }
+                if frame == 6 {
+                    // Removed entries may remain in the prefix; slot reuse cannot admit them.
+                    let dead = world
+                        .bodies
+                        .insert(RigidBodyBuilder::kinematic_position_based());
+                    world.bodies.remove(
+                        dead,
+                        &mut world.islands,
+                        &mut world.colliders,
+                        &mut world.impulse_joints,
+                        &mut world.multibody_joints,
+                        true,
+                    );
+                    let replacement = world
+                        .bodies
+                        .insert(RigidBodyBuilder::kinematic_position_based());
+                    world.bodies[replacement].set_next_kinematic_position(Pose::from_translation(
+                        Vector::X + Vector::Y * 2.0,
+                    ));
+                }
+            }
+            target_query_step(&mut control, false);
+            target_query_step(&mut candidate, true);
+            assert_eq!(
+                bincode::serialize(&control).unwrap(),
+                bincode::serialize(&candidate).unwrap(),
+                "fused target state changed at frame {frame}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "serde-serialize")]
+    fn collider_only_parent_admission_does_not_accept_an_old_target() {
+        use crate::prelude::*;
+        let mut seed = PhysicsWorld::new();
+        let (body, collider) = seed.insert(
+            RigidBodyBuilder::kinematic_position_based(),
+            ColliderBuilder::ball(0.7).density(2.0),
+        );
+        let target = Pose::from_translation(Vector::X * 2.0 + Vector::Y * 3.0);
+        seed.bodies[body].set_next_kinematic_position(target);
+        // Ordinary collision stepping consumes the queue without committing a target.
+        CollisionPipeline::new().step(
+            0.01,
+            &mut seed.islands,
+            &mut seed.broad_phase,
+            &mut seed.narrow_phase,
+            &mut seed.bodies,
+            &mut seed.colliders,
+            &(),
+            &(),
+        );
+        assert_ne!(
+            seed.bodies[body].position(),
+            seed.bodies[body].next_position()
+        );
+        assert_eq!(seed.bodies.iter_modified().count(), 0);
+        seed.colliders[collider].set_density(4.0);
+        let bytes = bincode::serialize(&seed).unwrap();
+        let mut control: PhysicsWorld = bincode::deserialize(&bytes).unwrap();
+        let mut candidate: PhysicsWorld = bincode::deserialize(&bytes).unwrap();
+        target_query_step(&mut control, false);
+        target_query_step(&mut candidate, true);
+        assert_ne!(*candidate.bodies[body].position(), target);
+        assert_eq!(
+            bincode::serialize(&control).unwrap(),
+            bincode::serialize(&candidate).unwrap()
+        );
+        // A subsequent explicit body edit does make that retained target eligible.
+        control.bodies.get_mut(body).unwrap();
+        candidate.bodies.get_mut(body).unwrap();
+        target_query_step(&mut control, false);
+        target_query_step(&mut candidate, true);
+        assert_eq!(*candidate.bodies[body].position(), target);
+        assert_eq!(
+            bincode::serialize(&control).unwrap(),
+            bincode::serialize(&candidate).unwrap()
+        );
+    }
     #[test]
     fn collider_edits_refresh_parent_mass_in_the_same_collision_only_pass() {
         use crate::prelude::*;
