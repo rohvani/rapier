@@ -464,6 +464,19 @@ impl NarrowPhase {
         }
     }
 
+    /// Restores the query dispatcher omitted by snapshot serialization, retaining the
+    /// contact/intersection graphs, warm starts, and cached query workspaces.
+    ///
+    /// The dispatcher must reproduce the original dispatcher's query semantics and accept
+    /// its workspace types. This restores matching snapshot behavior; it does not invalidate
+    /// cached contacts for a change of collision algorithms or policies in an active world.
+    pub fn restore_query_dispatcher<D>(&mut self, dispatcher: D)
+    where
+        D: 'static + PersistentQueryDispatcher<ContactManifoldData, ContactData>,
+    {
+        self.query_dispatcher = Arc::new(dispatcher);
+    }
+
     fn refresh_awake_body_mask(&mut self, islands: &IslandManager) {
         self.awake_body_mask.clear();
         let len = islands
@@ -478,3 +491,6 @@ impl NarrowPhase {
         }
     }
 }
+
+#[cfg(all(test, feature = "serde-serialize", feature = "dim3", feature = "std"))]
+mod test_lane_inventory;

@@ -1,5 +1,10 @@
 //! Structures related to geometry: colliders, shapes, etc.
 
+#[cfg(feature = "dim3")]
+mod cuboid_sat;
+#[cfg(feature = "dim3")]
+pub use cuboid_sat::cuboid_edge_separation;
+
 #[cfg(feature = "alloc")]
 pub(crate) use self::broad_phase_bvh::DeferredBvhOptimize;
 #[cfg(feature = "alloc")]

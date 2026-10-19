@@ -43,7 +43,7 @@ fn separating_face_certificate_matches_fresh_stock_contact_queries() {
                     base.translation + movement,
                     Rotation::from_scaled_axis(movement * 0.03) * base.rotation,
                 );
-                if !(0..3)
+                if !(0..6)
                     .any(|axis| cuboid_face_separates(first, second, &current, axis, prediction))
                 {
                     continue;
@@ -241,11 +241,80 @@ fn uncertain_face_proofs_fall_back() {
     let cube = Cuboid::new(Vector::splat(0.5));
     let pose = Pose::translation(1.02, 0.0, 0.0);
     assert!(!cuboid_face_separates(&cube, &cube, &pose, 0, 0.02));
-    assert!(!cuboid_face_separates(&cube, &cube, &pose, 3, 0.0));
+    assert!(!cuboid_face_separates(&cube, &cube, &pose, 6, 0.0));
     assert!(!cuboid_face_separates(&cube, &cube, &pose, 0, Real::NAN));
     assert!(!cuboid_face_separates(&cube, &cube, &pose, 0, -1.0));
     let invalid = Cuboid::new(Vector::new(Real::INFINITY, 0.5, 0.5));
     assert!(!cuboid_face_separates(&invalid, &cube, &pose, 0, 0.0));
+}
+
+#[test]
+fn second_box_face_preserves_empty_pair_contact_onset_and_motion() {
+    let rotation = Rotation::from_rotation_z(core::f32::consts::FRAC_PI_4);
+    let first_shape = Cuboid::new(Vector::splat(1.0));
+    let second_shape = Cuboid::new(Vector::new(2.0, 0.1, 0.1));
+    let pose = Pose::from_parts(Vector::new(1.7, -1.7, 0.0), rotation);
+    assert!(
+        !(0..3)
+            .any(|axis| { cuboid_face_separates(&first_shape, &second_shape, &pose, axis, 0.002) })
+    );
+    assert!(cuboid_face_separates(
+        &first_shape,
+        &second_shape,
+        &pose,
+        4,
+        0.002
+    ));
+    let make_world = || {
+        let mut world = PhysicsWorld::new();
+        world.gravity = Vector::ZERO;
+        let (_, first) = world.insert(
+            RigidBodyBuilder::fixed(),
+            ColliderBuilder::cuboid(1.0, 1.0, 1.0),
+        );
+        let (body, second) = world.insert(
+            RigidBodyBuilder::dynamic().pose(pose).can_sleep(false),
+            ColliderBuilder::cuboid(2.0, 0.1, 0.1),
+        );
+        (world, body, first, second)
+    };
+    let (mut optimized, body, first, second) = make_world();
+    let (mut legacy, _, _, _) = make_world();
+    for step in 0..180 {
+        // First translate along a separating face; then repeatedly enter/leave contact.
+        // The oracle clears only the certificate, retaining ordinary pose recycling.
+        let distance = if step < 20 {
+            2.3
+        } else {
+            1.51 + 0.09 * (step as Real * 0.3).sin()
+        };
+        let position = rotation * Vector::new(0.3 * (step as Real * 0.7).sin(), -distance, 0.0);
+        for world in [&mut optimized, &mut legacy] {
+            world.bodies[body].set_position(Pose::from_parts(position, rotation), true);
+            world.bodies[body].set_linvel(Vector::ZERO, true);
+            world.bodies[body].set_angvel(Vector::ZERO, true);
+        }
+        for edge in &mut legacy.narrow_phase.contact_graph.graph.edges {
+            if let Some(state) = &mut edge.weight.recycle_state {
+                state.separating_axis = None;
+            }
+        }
+        optimized.step();
+        legacy.step();
+        let a = &optimized.bodies[body];
+        let b = &legacy.bodies[body];
+        assert_eq!(
+            (a.position(), a.linvel(), a.angvel()),
+            (b.position(), b.linvel(), b.angvel()),
+            "step {step}"
+        );
+        let a = optimized.narrow_phase.contact_pair(first, second).unwrap();
+        let b = legacy.narrow_phase.contact_pair(first, second).unwrap();
+        assert_eq!(a.has_any_active_contact(), b.has_any_active_contact());
+        if step < 20 {
+            assert_eq!(a.recycle_state.unwrap().separating_axis, Some(4));
+        }
+    }
 }
 
 #[test]

@@ -18,10 +18,12 @@ use parry::math::SIMD_WIDTH;
 #[cfg(feature = "dim3")]
 use crate::dynamics::FrictionModel;
 
+use super::count_grouping::append_grouped;
 use super::sync::StageSync;
 use super::worker::run_worker;
 use super::{
-    CHUNK_BATCH, ChunkSegment, GroupLayout, LAYOUT_REF_WORKERS, SharedCtx, StagedIslandSolver,
+    CHUNK_BATCH, ChunkSegment, GroupLayout, LAYOUT_REF_SIMD_WIDTH, LAYOUT_REF_WORKERS, SharedCtx,
+    StagedIslandSolver,
 };
 
 impl StagedIslandSolver {
@@ -112,9 +114,9 @@ impl StagedIslandSolver {
             multibodies,
         );
 
-        // The persistent solver contact graph already holds two-body manifolds grouped by
-        // (color, contact count) — colors touch pairwise-disjoint bodies, buckets slice straight
-        // into SIMD chunks — and multibody manifolds apart; nothing to categorize/sort per step.
+        // The persistent graph holds body-disjoint colors and keeps multibody
+        // manifolds apart. Count grouping below may reorder only within a real
+        // color; the order of colors and the shared-body overflow stays unchanged.
         const NUM_COLORS: usize = 129; // 128 parallel colors + the overflow color.
         {
             let set = &mut self.contact_constraints;
@@ -173,9 +175,8 @@ impl StagedIslandSolver {
         self.color_ranges.clear();
         let mut next_chunk = 0usize;
 
-        // NOTE: the SIMD builders handle per-lane active-contact counts, so a color's whole
-        //       bucket slices straight into chunks (no count grouping). Buckets arrive colors
-        //       ascending, overflow last.
+        // The SIMD builders tolerate mixed counts, but every chunk executes its
+        // largest count. A linear counting pass reduces inactive lane work.
         let push_segment =
             |segments: &mut Vec<ChunkSegment>, next_chunk: &mut usize, refs: &[ContactRef]| {
                 if refs.is_empty() {
@@ -190,13 +191,31 @@ impl StagedIslandSolver {
             };
 
         if self.groups.len() == 1 {
-            // Single group (the common case): the historical zero-copy layout,
-            // slicing the persistent buckets directly.
+            // Populate all count-grouped copies before publishing segment pointers.
+            // Colors with no row savings still point directly into their buckets.
+            self.grouped_chunk_refs.reserve(num_two_body);
+            let mut grouped_ranges = [None; NUM_COLORS - 1];
+            for (color, refs) in graph.buckets() {
+                if (color as usize) < NUM_COLORS - 1 {
+                    let start = self.grouped_chunk_refs.len();
+                    if append_grouped(
+                        refs,
+                        store,
+                        &mut self.contact_count_scratch,
+                        &mut self.grouped_chunk_refs,
+                    ) {
+                        grouped_ranges[color as usize] =
+                            Some((start, self.grouped_chunk_refs.len()));
+                    }
+                }
+            }
             for (color, refs) in graph.buckets() {
                 if (color as usize) < NUM_COLORS - 1
-                    && refs.len().div_ceil(SIMD_WIDTH) >= min_color_chunks
+                    && refs.len().div_ceil(LAYOUT_REF_SIMD_WIDTH) >= min_color_chunks
                 {
                     let range_start = next_chunk;
+                    let refs = grouped_ranges[color as usize]
+                        .map_or(refs, |(start, end)| &self.grouped_chunk_refs[start..end]);
                     push_segment(&mut self.chunk_segments, &mut next_chunk, refs);
                     self.color_ranges.push((color, range_start..next_chunk));
                 }
@@ -227,8 +246,10 @@ impl StagedIslandSolver {
                     overflow_grouped_len = self.overflow_chunk_refs.len();
                     self.overflow_chunk_refs
                         .extend_from_slice(&set.interaction_groups.nongrouped_ref_interactions);
-                } else if refs.len().div_ceil(SIMD_WIDTH) < min_color_chunks {
+                } else if refs.len().div_ceil(LAYOUT_REF_SIMD_WIDTH) < min_color_chunks {
                     // A real color too small to parallelize: body-disjoint already.
+                    let refs = grouped_ranges[color as usize]
+                        .map_or(refs, |(start, end)| &self.grouped_chunk_refs[start..end]);
                     push_segment(&mut self.chunk_segments, &mut next_chunk, refs);
                 }
             }
@@ -309,7 +330,14 @@ impl StagedIslandSolver {
                         overflow_by_group[gi].extend_from_slice(scratch);
                     } else {
                         let start = self.grouped_chunk_refs.len() as u32;
-                        self.grouped_chunk_refs.extend_from_slice(scratch);
+                        if !append_grouped(
+                            scratch,
+                            store,
+                            &mut self.contact_count_scratch,
+                            &mut self.grouped_chunk_refs,
+                        ) {
+                            self.grouped_chunk_refs.extend_from_slice(scratch);
+                        }
                         runs[gi].push((color, start, scratch.len() as u32));
                     }
                 }
@@ -323,7 +351,7 @@ impl StagedIslandSolver {
                 let colors_start = self.color_ranges.len();
                 for (color, start, len) in &runs[gi] {
                     let refs = &self.grouped_chunk_refs[*start as usize..(*start + *len) as usize];
-                    if refs.len().div_ceil(SIMD_WIDTH) >= min_color_chunks {
+                    if refs.len().div_ceil(LAYOUT_REF_SIMD_WIDTH) >= min_color_chunks {
                         let range_start = next_chunk;
                         push_segment(&mut self.chunk_segments, &mut next_chunk, refs);
                         self.color_ranges.push((*color, range_start..next_chunk));
@@ -333,7 +361,7 @@ impl StagedIslandSolver {
                 for (color, start, len) in &runs[gi] {
                     let _ = color;
                     let refs = &self.grouped_chunk_refs[*start as usize..(*start + *len) as usize];
-                    if refs.len().div_ceil(SIMD_WIDTH) < min_color_chunks {
+                    if refs.len().div_ceil(LAYOUT_REF_SIMD_WIDTH) < min_color_chunks {
                         push_segment(&mut self.chunk_segments, &mut next_chunk, refs);
                     }
                 }

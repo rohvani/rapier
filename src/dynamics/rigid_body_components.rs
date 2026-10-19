@@ -527,43 +527,51 @@ impl RigidBodyMassProps {
     /// Update the world-space mass properties of `self`, taking into account the new position.
     pub fn update_world_mass_properties(&mut self, body_type: RigidBodyType, position: &Pose) {
         self.world_com = self.local_mprops.world_com(position);
+        // Fixed/kinematic bodies cannot respond to impulses. Keep their authored local
+        // properties for a later dynamic transition, but avoid rotating an inertia tensor
+        // whose every component would immediately be locked to zero.
+        if !body_type.is_dynamic() {
+            self.effective_inv_mass = Vector::ZERO;
+            self.effective_world_inv_inertia = AngularInertia::zero();
+            return;
+        }
         self.effective_inv_mass = Vector::splat(self.local_mprops.inv_mass);
         self.effective_world_inv_inertia = self.local_mprops.world_inv_inertia(&position.rotation);
 
         // Take into account translation/rotation locking.
-        if !body_type.is_dynamic() || self.flags.contains(LockedAxes::TRANSLATION_LOCKED_X) {
+        if self.flags.contains(LockedAxes::TRANSLATION_LOCKED_X) {
             self.effective_inv_mass.x = 0.0;
         }
 
-        if !body_type.is_dynamic() || self.flags.contains(LockedAxes::TRANSLATION_LOCKED_Y) {
+        if self.flags.contains(LockedAxes::TRANSLATION_LOCKED_Y) {
             self.effective_inv_mass.y = 0.0;
         }
 
         #[cfg(feature = "dim3")]
-        if !body_type.is_dynamic() || self.flags.contains(LockedAxes::TRANSLATION_LOCKED_Z) {
+        if self.flags.contains(LockedAxes::TRANSLATION_LOCKED_Z) {
             self.effective_inv_mass.z = 0.0;
         }
 
         #[cfg(feature = "dim2")]
         {
-            if !body_type.is_dynamic() || self.flags.contains(LockedAxes::ROTATION_LOCKED_Z) {
+            if self.flags.contains(LockedAxes::ROTATION_LOCKED_Z) {
                 self.effective_world_inv_inertia = 0.0;
             }
         }
         #[cfg(feature = "dim3")]
         {
-            if !body_type.is_dynamic() || self.flags.contains(LockedAxes::ROTATION_LOCKED_X) {
+            if self.flags.contains(LockedAxes::ROTATION_LOCKED_X) {
                 self.effective_world_inv_inertia.m11 = 0.0;
                 self.effective_world_inv_inertia.m12 = 0.0;
                 self.effective_world_inv_inertia.m13 = 0.0;
             }
 
-            if !body_type.is_dynamic() || self.flags.contains(LockedAxes::ROTATION_LOCKED_Y) {
+            if self.flags.contains(LockedAxes::ROTATION_LOCKED_Y) {
                 self.effective_world_inv_inertia.m22 = 0.0;
                 self.effective_world_inv_inertia.m12 = 0.0;
                 self.effective_world_inv_inertia.m23 = 0.0;
             }
-            if !body_type.is_dynamic() || self.flags.contains(LockedAxes::ROTATION_LOCKED_Z) {
+            if self.flags.contains(LockedAxes::ROTATION_LOCKED_Z) {
                 self.effective_world_inv_inertia.m33 = 0.0;
                 self.effective_world_inv_inertia.m13 = 0.0;
                 self.effective_world_inv_inertia.m23 = 0.0;
@@ -1474,6 +1482,50 @@ impl RigidBodyActivation {
 mod tests {
     use super::*;
     use crate::math::Real;
+
+    #[test]
+    fn fixed_and_kinematic_mass_properties_survive_dynamic_promotion() {
+        #[cfg(feature = "dim2")]
+        let (local, pose) = (
+            MassProperties::new(Vector::new(0.3, -0.7), 2.0, 3.0),
+            Pose::new(Vector::new(2.0, -3.0), 0.4),
+        );
+        #[cfg(feature = "dim3")]
+        let (local, pose) = (
+            MassProperties::with_principal_inertia_frame(
+                Vector::new(0.3, -0.7, 0.2),
+                2.0,
+                Vector::new(3.0, 5.0, 7.0),
+                Rotation::from_rotation_x(0.3),
+            ),
+            Pose::new(Vector::new(2.0, -3.0, 4.0), Vector::new(0.4, -0.2, 0.5)),
+        );
+        for flags in [
+            LockedAxes::empty(),
+            LockedAxes::TRANSLATION_LOCKED_X | LockedAxes::ROTATION_LOCKED_Z,
+            LockedAxes::all(),
+        ] {
+            let mut dynamic = RigidBodyMassProps::from(local);
+            dynamic.flags = flags;
+            dynamic.update_world_mass_properties(RigidBodyType::Dynamic, &pose);
+            for kind in [
+                RigidBodyType::Fixed,
+                RigidBodyType::KinematicPositionBased,
+                RigidBodyType::KinematicVelocityBased,
+            ] {
+                // Existing finite effective properties must clear, while an offset COM
+                // still follows the pose and promotion restores the original locked axes.
+                let mut changed = dynamic.clone();
+                changed.update_world_mass_properties(kind, &pose);
+                assert_eq!(changed.world_com, local.world_com(&pose));
+                assert_eq!(changed.effective_inv_mass, Vector::ZERO);
+                assert!(changed.effective_world_inv_inertia.is_zero());
+                assert_eq!(changed.local_mprops, local);
+                changed.update_world_mass_properties(RigidBodyType::Dynamic, &pose);
+                assert_eq!(changed, dynamic);
+            }
+        }
+    }
 
     #[test]
     fn test_interpolate_velocity() {

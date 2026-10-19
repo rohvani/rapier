@@ -5,7 +5,7 @@
 use core::sync::atomic::Ordering;
 
 #[cfg(feature = "dim3")]
-use crate::dynamics::rigid_body::gyroscopic_corrected_angvel;
+use crate::dynamics::rigid_body::{gyroscopic_corrected_angvel, gyroscopic_inertia_is_isotropic};
 use crate::dynamics::solver::JointConstraintsSet;
 use crate::dynamics::solver::contact_constraint::ContactWithCoulombFrictionBuilder;
 #[cfg(feature = "dim3")]
@@ -87,9 +87,16 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
                         gyro.principal_inertia = rb.mprops.local_mprops.principal_inertia();
                         gyro.inv_principal_inertia = rb.mprops.local_mprops.inv_principal_inertia;
                         gyro.principal_frame = rb.mprops.local_mprops.principal_inertia_local_frame;
-                        gyro.enabled = true;
-                        // SAFETY: shared atomic; claimed slots make the writes disjoint.
-                        unsafe { &*ctx.any_gyroscopic }.store(true, Ordering::Relaxed);
+                        // Equal principal inertias have zero gyroscopic torque at every pose.
+                        // Classify once per step so cube/sphere piles skip this substep work.
+                        gyro.enabled = !gyroscopic_inertia_is_isotropic(
+                            gyro.principal_inertia,
+                            gyro.inv_principal_inertia,
+                        );
+                        if gyro.enabled {
+                            // SAFETY: shared atomic; claimed slots make the writes disjoint.
+                            unsafe { &*ctx.any_gyroscopic }.store(true, Ordering::Relaxed);
+                        }
                     } else {
                         gyro.enabled = false;
                     }

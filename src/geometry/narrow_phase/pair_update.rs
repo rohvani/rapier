@@ -715,7 +715,7 @@ pub(super) fn process_pair(
                     .as_cuboid()
                     .zip(co2.shape.as_cuboid())
                     .and_then(|(first, second)| {
-                        (0..crate::math::DIM as u8).find(|axis| {
+                        (0..(2 * crate::math::DIM) as u8).find(|axis| {
                             cuboid_face_separates(
                                 first,
                                 second,
@@ -812,9 +812,11 @@ pub(super) fn process_pair(
     PairUpdateResult::new(outcome, cache_reason)
 }
 
-/// Test one of the first box's unit face axes, also tested by the stock cuboid SAT query.
-/// Its projected gap is |t_i| - a_i - dot(|R^T e_i|, b). A gap larger than the
-/// prediction region proves no contacts are possible; no other axis need be examined.
+/// Test a unit face axis from either box, also tested by the stock cuboid SAT query.
+/// The first DIM axes have gap |t_i| - a_i - dot(|R^T e_i|, b); the next DIM have
+/// gap |t dot R e_i| - b_i - dot(|R e_i|, a). Either box can certify separation,
+/// including rotated pairs whose projections overlap on all of the first box's axes.
+/// A gap larger than the prediction region proves no contacts are possible.
 /// Roundoff is charged against the gap, never against collision reach. Near the threshold
 /// or on malformed input, use the full dispatcher rather than accepting an uncertain proof.
 fn cuboid_face_separates(
@@ -824,7 +826,7 @@ fn cuboid_face_separates(
     axis: u8,
     prediction: Real,
 ) -> bool {
-    if axis as usize >= crate::math::DIM
+    if axis as usize >= 2 * crate::math::DIM
         || !first.half_extents.is_finite()
         || !second.half_extents.is_finite()
         || !first.half_extents.cmpge(crate::math::Vector::ZERO).all()
@@ -835,13 +837,21 @@ fn cuboid_face_separates(
     {
         return false;
     }
-    let axis = axis as usize;
+    let second_face = axis as usize >= crate::math::DIM;
+    let axis = axis as usize % crate::math::DIM;
     let mut direction = crate::math::Vector::ZERO;
     direction[axis] = 1.0;
-    let radius = (pos12.rotation.inverse() * direction)
-        .abs()
-        .dot(second.half_extents);
-    let gap = pos12.translation[axis].abs() - first.half_extents[axis] - radius;
+    let gap = if second_face {
+        let normal = pos12.rotation * direction;
+        pos12.translation.dot(normal).abs()
+            - second.half_extents[axis]
+            - normal.abs().dot(first.half_extents)
+    } else {
+        let radius = (pos12.rotation.inverse() * direction)
+            .abs()
+            .dot(second.half_extents);
+        pos12.translation[axis].abs() - first.half_extents[axis] - radius
+    };
     let scale = first.half_extents.max_element()
         + second.half_extents.max_element()
         + pos12.translation.abs().max_element()

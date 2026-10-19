@@ -278,7 +278,8 @@ pub(crate) struct ContactRecycleState {
     /// The last full update's solver count survives sleep clearing the dispatch hint.
     /// Reusing a contact cannot change this count, including a certified empty pair.
     pub qualified_count: u16,
-    /// First-cuboid face axis which separated an empty pair at its last full update.
+    /// Cuboid face axis which separated an empty pair at its last full update.
+    /// `0..DIM` selects the first cuboid; `DIM..2*DIM` selects the second.
     /// Recheck the current projected intervals when the ordinary pose cache expires.
     /// A certified empty update advances the reference pose just like a full query, so
     /// this optimization preserves the existing short speculative-contact reuse interval.

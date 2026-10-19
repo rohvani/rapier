@@ -34,7 +34,7 @@ The changes preserve the engine's existing collision and solver policies:
   An independent edge-array oracle covers parallel edges, self-loops, swap
   removals, clone, and serialization. The ignored `edge_existence_star_scaling_diagnostic`
   compares growth costs without imposing a machine-dependent timing assertion.
-- Empty cuboid contacts retain a certified separating face. After the ordinary
+- Empty cuboid contacts retain a certified separating face from either box. After the ordinary
   pose-recycling interval expires, projecting the current boxes onto that face
   can prove that another full manifold query would still be empty. The shortcut
   advances the reference pose exactly as the empty query would. It preserves
@@ -42,7 +42,7 @@ The changes preserve the engine's existing collision and solver policies:
   speculative contacts earlier. Shape/filter/hook changes and soft CCD fall back
   to the existing update. Increased prediction reach invalidates ordinary reuse
   and requires a fresh separation proof; non-finite values or uncertain separation
-  also fall back. Contact-onset/trajectory, random separation, snapshot,
+  also fall back. Rotated-box second-face contact transitions, random separation, snapshot,
   hook and runtime-edit fixtures cover the boundary cases.
 - Recycled contacts keep their solver-qualified manifold count. Sleeping still
   clears the dispatch hint; waking restores the stored count when an awake
@@ -55,6 +55,44 @@ The changes preserve the engine's existing collision and solver policies:
   last narrow-phase pass. Parallel workers aggregate locally and reduce after
   joining; the pair loop uses no counter atomics. Counts are diagnostic and do
   not change event or solver ordering.
+- `NarrowPhase::restore_query_dispatcher` reinstalls a snapshot's original query
+  dispatcher without discarding pair graphs, warm starts or cached workspaces.
+  Its dispatcher must retain the original query semantics and workspace types;
+  the method does not invalidate contacts for a runtime collision-policy change.
+  Distsim's Bevy fixture checks unchanged snapshot bytes and subsequent trajectories
+  when restoring its exact interior-sensor dispatcher.
+- Body-disjoint contact colors can group manifolds by descending active-point
+  count to reduce inactive SIMD rows. A counting pass costs O(n + K), where K
+  is the solver's maximum points per constraint; colors without a strict row
+  saving keep their original layout. Copies finish before raw chunk pointers
+  are created. Color order, generic contacts and shared-body overflow order
+  remain unchanged. Eight-lane builds use the four-lane threshold to classify
+  color eligibility, so widening alone does not move colors into the serial
+  tail. An independent sorted-count oracle checks membership and row costs;
+  serial/parallel engine, snapshot, clustering and application fixtures pass.
+  Captured contact-only replay trajectories match across four/eight lanes;
+  this is not a general cross-feature determinism guarantee for arbitrary
+  joint or overflow workloads.
+- `geometry::cuboid_edge_separation` batches the independent box edge axes into
+  four/eight SIMD lanes on x86-64/f32, with one scalar tail. It preserves the
+  stock normalization, support-point arithmetic and first-axis tie break; it
+  does not approximate separation or remove candidate axes. Other platforms,
+  double precision and enhanced determinism retain Parry's routine. The helper
+  is used by Distsim's cuboid dispatcher, leaving custom engine dispatchers intact.
+  Bitwise oracle fixtures cover 200,000 varied poses, degenerate axes and ties.
+- Fixed and kinematic bodies update their world center of mass but directly zero
+  effective inverse mass/inertia, avoiding a tensor rotation whose result is
+  discarded by axis locking. Authored local properties and lock flags survive
+  dynamic promotion. Offset-center/anisotropic-inertia transition fixtures cover
+  fixed and both kinematic modes in 2D/3D builds.
+- Equal finite, nonnegative principal inertias skip gyroscopic correction:
+  `omega cross (I * omega)` is zero for `I = lambda * identity`. Classification
+  occurs once per step and leaves the authored gyroscopic flag unchanged. The
+  public correction helper uses the same exact-equality guard; nearly isotropic
+  and anisotropic tensors retain the original path. Cube/sphere spin and applied
+  torque fixtures complement the existing precession and tilted-frame momentum
+  tests. Avoiding the principal-frame round trip removes its numerical spin
+  drift, so floating-point trajectories can differ from the previous build.
 
 The distsim repository pins this branch by commit through `third_party/rapier` and
 patches `rapier3d` to `crates/rapier3d`. Its separate Bevy bridge pin is unchanged.

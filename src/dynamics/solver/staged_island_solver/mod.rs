@@ -3,6 +3,7 @@
 //! batches between spin-barrier stages; joints/multibody solve in worker-0-exclusive stages.
 //! Deterministic: results depend only on the coloring, not on batch distribution.
 
+mod count_grouping;
 mod helpers;
 mod init;
 mod joints;
@@ -49,6 +50,12 @@ const JOINT_BATCH: usize = 16;
 /// so a pool-sized threshold would change the Gauss-Seidel order (and therefore the
 /// results) across machines with different core counts.
 const LAYOUT_REF_WORKERS: usize = 8;
+
+// Widening SIMD must not move a real color past other colors into the serial
+// tail. Retain the four-lane classification when selecting eight-lane kernels.
+// The shared-body overflow grouper remains width-dependent; this is not a
+// cross-feature determinism promise for arbitrary joint/composite scenes.
+const LAYOUT_REF_SIMD_WIDTH: usize = if SIMD_WIDTH == 8 { 4 } else { SIMD_WIDTH };
 
 /// Claim-batch size of a constraint stage (~8 claims per worker): tiny batches multiply the
 /// claim/steal cross-core traffic (measurably throttles high worker counts); huge batches leave
@@ -233,10 +240,11 @@ pub(crate) struct StagedIslandSolver {
     /// The substep solve-groups (see [`GroupLayout`]); rebuilt every step,
     /// single spanning entry on the ungrouped fast path.
     groups: Vec<GroupLayout>,
-    /// Stable storage for the multi-group chunk refs: per-(group, color)
-    /// contiguous copies of the persistent buckets' refs (the single-group
-    /// path points straight into the buckets and never fills this).
+    /// Stable storage for per-(group, color) copies. Single-group colors only
+    /// use this when grouping by contact count avoids inactive SIMD row work.
     grouped_chunk_refs: Vec<ContactRef>,
+    /// Contact counts for one color, reused by the linear-time counting pass.
+    contact_count_scratch: Vec<u8>,
     joint_colors: ParallelInteractionGroups,
     /// Per parallel joint color: color id and SIMD joint-chunk index range; lanes within a
     /// range touch pairwise-disjoint bodies. Joint coloring shares the contacts' color space
@@ -303,6 +311,7 @@ impl StagedIslandSolver {
             color_ranges: Vec::new(),
             groups: Vec::new(),
             grouped_chunk_refs: Vec::new(),
+            contact_count_scratch: Vec::new(),
             overflow_scratch: Vec::new(),
             joint_colors: ParallelInteractionGroups::new(),
             joint_color_ranges: Vec::new(),

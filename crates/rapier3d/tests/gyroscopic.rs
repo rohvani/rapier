@@ -155,3 +155,58 @@ fn angular_momentum_conserved_with_tilted_principal_frame() {
         "world angular-momentum direction drifted (min cos = {min_cos})"
     );
 }
+
+#[test]
+fn isotropic_inertia_preserves_spin_exactly_in_every_orientation() {
+    for shape in [SharedShape::cuboid(0.5, 0.5, 0.5), SharedShape::ball(0.5)] {
+        for tilt in [Vector::ZERO, Vector::new(0.3, -0.7, 0.2)] {
+            let mut world = PhysicsWorld::new();
+            world.gravity = Vector::ZERO;
+            let angular = Vector::new(1.3, -2.1, 0.7);
+            let (body, _) = world.insert(
+                RigidBodyBuilder::dynamic()
+                    .rotation(tilt)
+                    .angvel(angular)
+                    .can_sleep(false),
+                ColliderBuilder::new(shape.clone()).density(2.0),
+            );
+            // Exercise the public helper too, independently of staged-solver classification.
+            assert_eq!(
+                world.bodies[body].angvel_with_gyroscopic_forces(1.0 / 60.0),
+                angular
+            );
+            for _ in 0..300 {
+                world.step();
+                assert_eq!(world.bodies[body].angvel(), angular);
+            }
+        }
+    }
+}
+
+#[test]
+fn isotropic_body_keeps_applied_torques_when_gyro_work_is_skipped() {
+    let make = |gyro| {
+        let mut world = PhysicsWorld::new();
+        world.gravity = Vector::ZERO;
+        let (body, _) = world.insert(
+            RigidBodyBuilder::dynamic()
+                .rotation(Vector::new(0.4, 0.2, -0.3))
+                .angvel(Vector::new(0.1, -0.2, 0.3))
+                .gyroscopic_forces_enabled(gyro)
+                .can_sleep(false),
+            ColliderBuilder::cuboid(0.5, 0.5, 0.5),
+        );
+        world.bodies[body].add_torque(Vector::new(0.07, -0.1, 0.05), true);
+        (world, body)
+    };
+    let (mut enabled, a) = make(true);
+    let (mut disabled, b) = make(false);
+    let initial = enabled.bodies[a].angvel();
+    for _ in 0..300 {
+        enabled.step();
+        disabled.step();
+        assert_eq!(enabled.bodies[a].angvel(), disabled.bodies[b].angvel());
+        assert_eq!(enabled.bodies[a].position(), disabled.bodies[b].position());
+    }
+    assert_ne!(enabled.bodies[a].angvel(), initial);
+}

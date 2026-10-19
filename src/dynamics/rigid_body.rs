@@ -2027,6 +2027,12 @@ pub(crate) fn gyroscopic_corrected_angvel(
     inv_principal_inertia: AngVector,
     dt: Real,
 ) -> AngVector {
+    // For I = lambda * identity, omega cross (I * omega) is exactly zero. Skipping
+    // the principal-frame round trip also avoids introducing numerical spin drift.
+    // Equality is exact: nearly spherical bodies still need the ordinary correction.
+    if gyroscopic_inertia_is_isotropic(principal_inertia, inv_principal_inertia) {
+        return angvel;
+    }
     // NOTE: integrating the gyroscopic forces implicitly are both slower and
     //       very dissipative. Instead, we only keep the explicit term and
     //       ensure angular momentum is preserved (similar to Jolt).
@@ -2043,4 +2049,19 @@ pub(crate) fn gyroscopic_corrected_angvel(
     } else {
         angvel
     }
+}
+
+/// Isotropy is a property of the mass tensor, independent of orientation or shape kind.
+/// Keep malformed/non-finite inertia on the ordinary path so quarantine can detect it.
+#[cfg(feature = "dim3")]
+#[inline]
+pub(crate) fn gyroscopic_inertia_is_isotropic(inertia: AngVector, inverse: AngVector) -> bool {
+    inertia.is_finite()
+        && inverse.is_finite()
+        && inertia.x >= 0.0
+        && inverse.x >= 0.0
+        && inertia.x == inertia.y
+        && inertia.x == inertia.z
+        && inverse.x == inverse.y
+        && inverse.x == inverse.z
 }
