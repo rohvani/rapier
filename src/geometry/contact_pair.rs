@@ -111,6 +111,10 @@ pub struct IntersectionPair {
     pub intersecting: bool,
     /// Was a `CollisionEvent::Started` emitted for this collider?
     pub(crate) start_event_emitted: bool,
+    // Built-in pair filtering depends on topology/type/groups, not either pose. Recheck
+    // after restore; omitting this derived cache preserves the snapshot schema.
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub(crate) filter_valid: bool,
 }
 
 impl IntersectionPair {
@@ -118,6 +122,7 @@ impl IntersectionPair {
         Self {
             intersecting: false,
             start_event_emitted: false,
+            filter_valid: false,
         }
     }
 

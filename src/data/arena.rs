@@ -53,11 +53,34 @@ enum Entry<T> {
 /// let idx = arena.insert(123);
 /// assert_eq!(arena[idx], 123);
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 pub struct Index {
     index: u32,
     generation: u32,
+}
+
+impl core::hash::Hash for Index {
+    #[inline]
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        // Both words identify a handle, including slot reuse. Feed them together so keyed
+        // hashers need not buffer two partial words for every body/collider map lookup.
+        // Preserve the native byte sequence of the former field-wise implementation for
+        // byte-oriented hashers. Hasher-specific integer mixing may still change hash values;
+        // those values are not serialized identity or a promised iteration order.
+        let index = self.index.to_ne_bytes();
+        let generation = self.generation.to_ne_bytes();
+        state.write_u64(u64::from_ne_bytes([
+            index[0],
+            index[1],
+            index[2],
+            index[3],
+            generation[0],
+            generation[1],
+            generation[2],
+            generation[3],
+        ]));
+    }
 }
 
 impl Default for Index {
@@ -1187,5 +1210,63 @@ impl<T> ops::Index<Index> for Arena<T> {
 impl<T> ops::IndexMut<Index> for Arena<T> {
     fn index_mut(&mut self, index: Index) -> &mut Self::Output {
         self.get_mut(index).expect("No element at index")
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod hash_tests {
+    use super::*;
+    use core::hash::{Hash, Hasher};
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Bytes(Vec<u8>);
+    impl Hasher for Bytes {
+        fn finish(&self) -> u64 {
+            0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.extend_from_slice(bytes);
+        }
+    }
+
+    #[test]
+    fn handle_hash_keeps_both_words_in_native_byte_order() {
+        let mut seed = 0x9a23_eac7_0471_254fu64;
+        for (index, generation) in [(0, 0), (0, u32::MAX), (u32::MAX, 0), (u32::MAX, u32::MAX)]
+            .into_iter()
+            .chain((0..10000).map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (seed as u32, (seed >> 32) as u32)
+            }))
+        {
+            let mut old = Bytes::default();
+            index.hash(&mut old);
+            generation.hash(&mut old);
+            let mut new = Bytes::default();
+            Index::from_raw_parts(index, generation).hash(&mut new);
+            assert_eq!(new.0, old.0);
+            assert_eq!(new.0.len(), 8);
+        }
+    }
+
+    #[test]
+    fn hashed_handle_keys_distinguish_retired_and_reused_slots() {
+        let mut arena = Arena::new();
+        let old = arena.insert(1);
+        arena.remove(old).unwrap();
+        let replacement = arena.insert(2);
+        assert_eq!(old.into_raw_parts().0, replacement.into_raw_parts().0);
+        assert_ne!(old, replacement);
+        let mut map = HashMap::new();
+        map.insert(old, "retired");
+        map.insert(replacement, "current");
+        map.insert(Index::default(), "invalid");
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.remove(&old), Some("retired"));
+        assert_eq!(map.get(&replacement), Some(&"current"));
+        assert_eq!(map.get(&Index::default()), Some(&"invalid"));
+        assert_eq!(arena.get(old), None);
+        assert_eq!(arena.get(replacement), Some(&2));
     }
 }

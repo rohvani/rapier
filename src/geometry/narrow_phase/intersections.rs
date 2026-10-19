@@ -7,7 +7,7 @@ use rayon::prelude::*;
 use super::{NarrowPhase, collect_pairs_to_update};
 use crate::alloc_prelude::*;
 use crate::dynamics::{IslandManager, RigidBodySet, RigidBodyType};
-use crate::geometry::{ColliderHandle, ColliderSet, IntersectionPair};
+use crate::geometry::{Collider, ColliderChanges, ColliderHandle, ColliderSet, IntersectionPair};
 use crate::pipeline::{ActiveEvents, ActiveHooks, EventHandler, PairFilterContext, PhysicsHooks};
 #[cfg(feature = "parallel")]
 use crate::utils::SyncPtr;
@@ -75,35 +75,25 @@ impl NarrowPhase {
                     return None;
                 }
 
-                if rb_handle1 == rb_handle2 && co1.parent.is_some() {
-                    // Same parents. Ignore collisions.
-                    edge.weight.intersecting = false;
-                    break 'emit_events;
-                }
-                // TODO: avoid lookup into bodies.
-                let mut rb_type1 = RigidBodyType::Fixed;
-                let mut rb_type2 = RigidBodyType::Fixed;
-
-                if let Some(co_parent1) = &co1.parent {
-                    rb_type1 = bodies[co_parent1.handle].body_type;
-                }
-
-                if let Some(co_parent2) = &co2.parent {
-                    rb_type2 = bodies[co_parent2.handle].body_type;
-                }
-
-                // Filter based on the rigid-body types.
-                if !co1.flags.active_collision_types.test(rb_type1, rb_type2)
-                    && !co2.flags.active_collision_types.test(rb_type1, rb_type2)
+                // Position and mass edits preserve same-parent, body-type and group filtering.
+                // All other collider changes invalidate the proof, including body type changes
+                // propagated by the pipeline. Hooks below still run on every ordinary candidate.
+                let filter_safe = ColliderChanges::IN_MODIFIED_SET
+                    | ColliderChanges::POSITION
+                    | ColliderChanges::LOCAL_MASS_PROPERTIES;
+                if !edge.weight.filter_valid
+                    || !((co1.changes | co2.changes) & !filter_safe).is_empty()
                 {
-                    edge.weight.intersecting = false;
-                    break 'emit_events;
-                }
-
-                // Filter based on collision groups.
-                if !co1.flags.collision_groups.test(co2.flags.collision_groups) {
-                    edge.weight.intersecting = false;
-                    break 'emit_events;
+                    edge.weight.filter_valid = built_in_filter_allows(co1, co2, bodies);
+                    if !edge.weight.filter_valid {
+                        edge.weight.intersecting = false;
+                        break 'emit_events;
+                    }
+                } else {
+                    // Execute the full predicate in release fixtures too, so a missed
+                    // invalidation cannot hide behind optimized builds of the regression suite.
+                    #[cfg(any(test, debug_assertions))]
+                    assert!(built_in_filter_allows(co1, co2, bodies));
                 }
 
                 let active_hooks = co1.flags.active_hooks | co2.flags.active_hooks;
@@ -219,3 +209,23 @@ impl NarrowPhase {
         self.awake_body_mask = awake_body_mask;
     }
 }
+
+#[inline]
+fn built_in_filter_allows(co1: &Collider, co2: &Collider, bodies: &RigidBodySet) -> bool {
+    if co1.parent.is_some() && co1.parent.map(|p| p.handle) == co2.parent.map(|p| p.handle) {
+        return false;
+    }
+    let body_type = |co: &Collider| {
+        co.parent
+            .map(|p| bodies[p.handle].body_type)
+            .unwrap_or(RigidBodyType::Fixed)
+    };
+    let (first, second) = (body_type(co1), body_type(co2));
+    (co1.flags.active_collision_types.test(first, second)
+        || co2.flags.active_collision_types.test(first, second))
+        && co1.flags.collision_groups.test(co2.flags.collision_groups)
+}
+
+#[cfg(all(test, feature = "std"))]
+#[path = "test_intersection_filters.rs"]
+mod tests;

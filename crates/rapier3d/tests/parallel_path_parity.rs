@@ -25,10 +25,14 @@
 use rapier3d::prelude::*;
 
 /// Golden hash of [`run`]. Identical in every build; re-mint (with a note saying why)
-/// only when a change is *meant* to alter the simulation.
+/// only when a change is *meant* to alter the simulation or its stored cache layout.
 /// Includes the fork's serialized contact-recycling count and separating-face cache.
 /// Both feature modes must preserve the same stored state as well as the same motion.
-const GOLDEN: u64 = 0xa0bd_b932_60a1_b109;
+/// Value-only body edits now preserve the active-set epoch. Fewer full rebuilds retain
+/// a different order within body-disjoint solver buckets (and their back-references).
+/// Serial/parallel controls agree on those bytes; the previous epoch policy gives the
+/// same broad phase, body motion, manifolds and bucket membership, but a different layout.
+const GOLDEN: u64 = 0x47d8_5da7_8b7d_e40f;
 
 /// FNV-1a.
 struct Fnv(u64);
